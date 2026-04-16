@@ -1,0 +1,23 @@
+=== URL-style strings ===
+insert                 : 12533.94 ops/sec (7.98 s)
+  found=50000/50000
+point lookup           : 408187.84 ops/sec (0.12 s)
+  avg_rows=31
+range scan             : 49106.33 ops/sec (0.20 s)
+  tree_size=100000 height=3
+
+=== Wikipedia-style titles ===
+insert                 : 30660.23 ops/sec (3.26 s)
+  found=50000/50000
+point lookup           : 530957.95 ops/sec (0.09 s)
+  avg_rows=31
+range scan             : 50762.02 ops/sec (0.20 s)
+  tree_size=100000 height=3
+
+=== Integer strings ===
+insert                 : 9495.86 ops/sec (10.53 s)
+  found=50000/50000
+point lookup           : 424830.19 ops/sec (0.12 s)
+  avg_rows=32
+range scan             : 30610.29 ops/sec (0.33 s)
+  tree_size=100000 height=3
