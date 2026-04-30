@@ -40,14 +40,14 @@ cmake --build build -j
 ### 2) Run the benchmark target
 
 ```bash
-./build/benchmark 100000
+./build/benchmark
 ```
 
 ### 3) Fallback: direct compiler invocation (without CMake)
 
 ```bash
 c++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude src/*.cpp benchmark/benchmark.cpp -o benchmark_app
-./benchmark_app 100000
+./benchmark_app
 ```
 
 ## Usage / Running Benchmarks

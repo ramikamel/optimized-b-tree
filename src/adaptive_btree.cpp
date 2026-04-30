@@ -38,6 +38,7 @@ namespace abt
 
     AdaptiveBTree::AdaptiveBTree(FeatureFlags features) : features_(features)
     {
+        nodes_.resize(100000); // Pre-allocate capacity to avoid constant reallocations
         root_id_ = allocateLeaf();
     }
 
@@ -78,38 +79,29 @@ namespace abt
         return leaf->find(key);
     }
 
-    std::vector<KeyValue> AdaptiveBTree::rangeScan(std::string_view start_key,
-                                                   std::size_t max_results) const
-    {
+    std::vector<KeyValue> AdaptiveBTree::rangeScan(std::string_view start_key, std::size_t max_results) const {
         std::vector<KeyValue> results;
-        if (max_results == 0)
-        {
-            return results;
-        }
+        if (max_results == 0) return results;
 
         NodeId leaf_id = findLeafForKey(start_key);
         bool first_leaf = true;
 
-        while (leaf_id != 0 && results.size() < max_results)
-        {
+        while (leaf_id != 0 && results.size() < max_results) {
             const LeafNode *leaf = getLeaf(leaf_id);
-            const std::vector<LeafEntry> entries = leaf->entries();
+            const std::uint16_t count = leaf->slotCount(); 
 
-            for (const LeafEntry &entry : entries)
-            {
-                if (first_leaf && entry.key < start_key)
-                {
-                    continue;
-                }
-
-                results.push_back(KeyValue{entry.key, entry.value});
-                if (results.size() >= max_results)
-                {
-                    break;
-                }
+            std::uint16_t i = 0;
+            // Instantly jump to the target key on the first leaf using binary search
+            if (first_leaf) {
+                i = static_cast<std::uint16_t>(leaf->lowerBoundIndex(start_key));
+                first_leaf = false;
             }
 
-            first_leaf = false;
+            for (; i < count; ++i) {
+                results.push_back(KeyValue{leaf->keyAt(i), leaf->valueAt(i)});
+                if (results.size() >= max_results) break;
+            }
+
             leaf_id = leaf->nextLeaf();
         }
 
@@ -129,35 +121,35 @@ namespace abt
     NodeId AdaptiveBTree::allocateLeaf()
     {
         const NodeId id = next_node_id_++;
-        nodes_.emplace(id, std::make_unique<LeafNode>(id));
+        if (id >= nodes_.size()) nodes_.resize(id * 2); // Resize vector if needed
+        nodes_[id] = std::make_unique<LeafNode>(id);
         return id;
     }
 
     NodeId AdaptiveBTree::allocateInner()
     {
         const NodeId id = next_node_id_++;
-        nodes_.emplace(id, std::make_unique<InnerNode>(id));
+        if (id >= nodes_.size()) nodes_.resize(id * 2); // Resize vector if needed
+        nodes_[id] = std::make_unique<InnerNode>(id);
         return id;
     }
 
     Node *AdaptiveBTree::getNode(NodeId id)
     {
-        auto it = nodes_.find(id);
-        if (it == nodes_.end())
+        if (id >= nodes_.size() || !nodes_[id])
         {
             throw std::out_of_range("node id not found");
         }
-        return it->second.get();
+        return nodes_[id].get();
     }
 
     const Node *AdaptiveBTree::getNode(NodeId id) const
     {
-        auto it = nodes_.find(id);
-        if (it == nodes_.end())
+        if (id >= nodes_.size() || !nodes_[id])
         {
             throw std::out_of_range("node id not found");
         }
-        return it->second.get();
+        return nodes_[id].get();
     }
 
     LeafNode *AdaptiveBTree::getLeaf(NodeId id)
@@ -210,6 +202,14 @@ namespace abt
         if (node->isLeaf())
         {
             LeafNode *leaf = static_cast<LeafNode *>(node);
+
+            // --- OPTIMIZATION: Try fast in-place insert first! ---
+            if (leaf->tryInsertInPlace(key, value, *inserted_new))
+            {
+                return std::nullopt;
+            }
+
+            // --- FALLBACK: Rebuild and Split if page is full or prefix doesn't match ---
             std::vector<LeafEntry> entries = leaf->entries();
 
             auto it = std::lower_bound(entries.begin(), entries.end(), key, [](const LeafEntry &lhs, const std::string &rhs)
@@ -260,6 +260,13 @@ namespace abt
             return std::nullopt;
         }
 
+        // --- OPTIMIZATION: Try fast in-place inner insert! ---
+        if (inner->tryInsertInPlace(child_split->separator_key, child_split->right_node))
+        {
+            return std::nullopt;
+        }
+
+        // --- FALLBACK: Rebuild and split inner node ---
         InnerMaterialized state = inner->materialize();
         state.entries.insert(state.entries.begin() + child_index,
                              InnerEntry{child_split->separator_key, child_split->right_node});
@@ -298,80 +305,33 @@ namespace abt
         return current;
     }
 
-    std::size_t AdaptiveBTree::chooseLeafSplitIndex(const std::vector<LeafEntry> &entries)
-    {
-        if (entries.size() < 2)
-        {
-            return 1;
+    std::size_t AdaptiveBTree::chooseLeafSplitIndex(const std::vector<LeafEntry> &entries) {
+        if (entries.size() < 2) return 1;
+        
+        // O(N) single-pass byte counting instead of O(N^2) string allocations
+        std::size_t total_bytes = 0;
+        for (const auto& e : entries) total_bytes += e.key.size() + sizeof(Value);
+        
+        std::size_t current_bytes = 0;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            current_bytes += entries[i].key.size() + sizeof(Value);
+            if (current_bytes >= total_bytes / 2) return std::max<std::size_t>(1, i);
         }
-
-        std::size_t best_index = entries.size() / 2;
-        std::size_t best_balance = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t i = 1; i < entries.size(); ++i)
-        {
-            const std::size_t left_bytes = estimateLeafBytes(entries, 0, i);
-            const std::size_t right_bytes = estimateLeafBytes(entries, i, entries.size());
-
-            if (left_bytes > kPageSizeBytes || right_bytes > kPageSizeBytes)
-            {
-                continue;
-            }
-
-            const std::size_t balance =
-                left_bytes > right_bytes ? left_bytes - right_bytes : right_bytes - left_bytes;
-            if (balance < best_balance)
-            {
-                best_balance = balance;
-                best_index = i;
-            }
-        }
-
-        if (best_index == 0)
-        {
-            best_index = 1;
-        }
-        if (best_index >= entries.size())
-        {
-            best_index = entries.size() - 1;
-        }
-        return best_index;
+        return entries.size() / 2;
     }
 
-    std::size_t AdaptiveBTree::chooseInnerSplitIndex(const std::vector<InnerEntry> &entries)
-    {
-        if (entries.size() < 2)
-        {
-            return 0;
+    std::size_t AdaptiveBTree::chooseInnerSplitIndex(const std::vector<InnerEntry> &entries) {
+        if (entries.size() < 2) return 0;
+        
+        std::size_t total_bytes = 0;
+        for (const auto& e : entries) total_bytes += e.key.size() + sizeof(NodeId);
+        
+        std::size_t current_bytes = 0;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            current_bytes += entries[i].key.size() + sizeof(NodeId);
+            if (current_bytes >= total_bytes / 2) return std::max<std::size_t>(0, i);
         }
-
-        std::size_t best_index = entries.size() / 2;
-        std::size_t best_balance = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t i = 1; i < entries.size(); ++i)
-        {
-            const std::size_t left_bytes = estimateInnerBytes(entries, 0, i);
-            const std::size_t right_bytes = estimateInnerBytes(entries, i + 1, entries.size());
-
-            if (left_bytes > kPageSizeBytes || right_bytes > kPageSizeBytes)
-            {
-                continue;
-            }
-
-            const std::size_t balance =
-                left_bytes > right_bytes ? left_bytes - right_bytes : right_bytes - left_bytes;
-            if (balance < best_balance)
-            {
-                best_balance = balance;
-                best_index = i;
-            }
-        }
-
-        if (best_index >= entries.size())
-        {
-            best_index = entries.size() / 2;
-        }
-        return best_index;
+        return entries.size() / 2;
     }
 
     std::size_t AdaptiveBTree::estimateLeafBytes(const std::vector<LeafEntry> &entries,

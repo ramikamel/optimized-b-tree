@@ -58,6 +58,7 @@ namespace abt
         std::size_t freeSpace() const;
 
         std::string prefix() const;
+        std::string_view prefixView() const;
         void setPrefix(std::string_view prefix);
 
         bool hasSpaceForLeaf(std::size_t key_len, std::size_t value_len) const;

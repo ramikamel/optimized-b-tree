@@ -30,6 +30,11 @@ namespace abt
         NodeId nextLeaf() const;
         void setNextLeaf(NodeId id);
 
+        bool tryInsertInPlace(std::string_view key, Value value, bool& inserted_new);
+        std::uint16_t slotCount() const;
+        std::string keyAt(std::uint16_t index) const;
+        Value valueAt(std::uint16_t index) const;
+
     private:
         int compareKeyAt(std::uint16_t slot_index, std::string_view key) const;
         static std::string commonPrefix(const std::vector<LeafEntry> &sorted_entries);

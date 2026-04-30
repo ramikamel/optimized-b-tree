@@ -65,7 +65,7 @@ namespace abt
                                               std::size_t end);
 
         FeatureFlags features_;
-        std::unordered_map<NodeId, std::unique_ptr<Node>> nodes_;
+        std::vector<std::unique_ptr<Node>> nodes_;
 
         NodeId root_id_ = 0;
         NodeId next_node_id_ = 1;

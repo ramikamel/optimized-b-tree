@@ -1,23 +1,110 @@
-=== URL-style strings ===
-insert                 : 12533.94 ops/sec (7.98 s)
-  found=50000/50000
-point lookup           : 408187.84 ops/sec (0.12 s)
-  avg_rows=31
-range scan             : 49106.33 ops/sec (0.20 s)
-  tree_size=100000 height=3
+========================================================
+      SCALING BENCHMARK: 100000 KEYS
+========================================================
 
-=== Wikipedia-style titles ===
-insert                 : 30660.23 ops/sec (3.26 s)
-  found=50000/50000
-point lookup           : 530957.95 ops/sec (0.09 s)
-  avg_rows=31
-range scan             : 50762.02 ops/sec (0.20 s)
-  tree_size=100000 height=3
+>>> URL-style strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 342305.69 ops/sec (0.29 s)
+point lookup           : 689534.31 ops/sec (0.07 s)
+range scan             : 117416.48 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 3989301.97 ops/sec (0.03 s)
+point lookup           : 554157.59 ops/sec (0.09 s)
+range scan             : 145179.41 ops/sec (0.07 s)
+--------------------------------------------------------
 
-=== Integer strings ===
-insert                 : 9495.86 ops/sec (10.53 s)
-  found=50000/50000
-point lookup           : 424830.19 ops/sec (0.12 s)
-  avg_rows=32
-range scan             : 30610.29 ops/sec (0.33 s)
-  tree_size=100000 height=3
+>>> Wikipedia-style titles <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 442185.37 ops/sec (0.23 s)
+point lookup           : 849562.93 ops/sec (0.06 s)
+range scan             : 118092.69 ops/sec (0.08 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 4013002.13 ops/sec (0.02 s)
+point lookup           : 554393.13 ops/sec (0.09 s)
+range scan             : 135206.54 ops/sec (0.07 s)
+--------------------------------------------------------
+
+>>> Integer strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 449008.28 ops/sec (0.22 s)
+point lookup           : 732936.33 ops/sec (0.07 s)
+range scan             : 109801.83 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 4610570.05 ops/sec (0.02 s)
+point lookup           : 635421.58 ops/sec (0.08 s)
+range scan             : 135961.16 ops/sec (0.07 s)
+--------------------------------------------------------
+
+========================================================
+      SCALING BENCHMARK: 500000 KEYS
+========================================================
+
+>>> URL-style strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 295051.81 ops/sec (1.69 s)
+point lookup           : 509176.85 ops/sec (0.10 s)
+range scan             : 115073.53 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 3577293.85 ops/sec (0.14 s)
+point lookup           : 508823.64 ops/sec (0.10 s)
+range scan             : 144265.27 ops/sec (0.07 s)
+--------------------------------------------------------
+
+>>> Wikipedia-style titles <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 409637.00 ops/sec (1.22 s)
+point lookup           : 621331.55 ops/sec (0.08 s)
+range scan             : 106022.94 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 3745229.50 ops/sec (0.13 s)
+point lookup           : 523864.20 ops/sec (0.10 s)
+range scan             : 134074.69 ops/sec (0.07 s)
+--------------------------------------------------------
+
+>>> Integer strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 426771.41 ops/sec (1.17 s)
+point lookup           : 597117.12 ops/sec (0.08 s)
+range scan             : 104545.33 ops/sec (0.10 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 4197041.28 ops/sec (0.12 s)
+point lookup           : 612972.96 ops/sec (0.08 s)
+range scan             : 138317.45 ops/sec (0.07 s)
+--------------------------------------------------------
+
+========================================================
+      SCALING BENCHMARK: 1000000 KEYS
+========================================================
+
+>>> URL-style strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 297160.19 ops/sec (3.37 s)
+point lookup           : 530099.96 ops/sec (0.09 s)
+range scan             : 113986.58 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 3624001.40 ops/sec (0.28 s)
+point lookup           : 445819.05 ops/sec (0.11 s)
+range scan             : 135633.30 ops/sec (0.07 s)
+--------------------------------------------------------
+
+>>> Wikipedia-style titles <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 381772.23 ops/sec (2.62 s)
+point lookup           : 559370.15 ops/sec (0.09 s)
+range scan             : 108611.64 ops/sec (0.09 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 3724912.72 ops/sec (0.27 s)
+point lookup           : 447435.47 ops/sec (0.11 s)
+range scan             : 127625.02 ops/sec (0.08 s)
+--------------------------------------------------------
+
+>>> Integer strings <<<
+[Adaptive B-Tree: Slotted Pages + Truncation + Hints]
+insert                 : 418563.03 ops/sec (2.39 s)
+point lookup           : 531115.40 ops/sec (0.09 s)
+range scan             : 104495.62 ops/sec (0.10 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 4153349.26 ops/sec (0.24 s)
+point lookup           : 557426.29 ops/sec (0.09 s)
+range scan             : 134236.82 ops/sec (0.07 s)
+--------------------------------------------------------

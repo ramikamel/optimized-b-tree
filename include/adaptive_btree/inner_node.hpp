@@ -34,6 +34,8 @@ namespace abt
         NodeId childAt(std::size_t child_index) const;
         NodeId childForKey(std::string_view key) const;
 
+        bool tryInsertInPlace(std::string_view key, NodeId right_child);
+
     private:
         int compareKeyAt(std::uint16_t slot_index, std::string_view key) const;
         static std::string commonPrefix(const std::vector<InnerEntry> &sorted_entries);

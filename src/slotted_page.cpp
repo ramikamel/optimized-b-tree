@@ -47,6 +47,12 @@ namespace abt
         return std::string(begin, begin + h.prefix_len);
     }
 
+    std::string_view SlottedPage::prefixView() const {
+        const Header &h = header();
+        const char *begin = reinterpret_cast<const char *>(bytes_.data() + sizeof(Header));
+        return std::string_view(begin, h.prefix_len);
+    }
+
     void SlottedPage::setPrefix(std::string_view prefix_value)
     {
         if (header().slot_count != 0)
