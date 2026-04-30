@@ -6,6 +6,8 @@
 #include <optional>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 
 namespace bpt {
 
@@ -16,22 +18,67 @@ struct KeyValue {
     Value value;
 };
 
-// A standard B+-Tree modeling traditional unoptimized in-memory indexes.
-// It uses std::string, exposing the cache-miss penalty of heap indirection 
-// that slotted-pages are designed to fix.
+// Represents the unoptimized database-style Slotted Page defined in the paper.
+// All variable-sized strings are stored inline inside the node's byte buffer.
+// No Prefix Truncation or Hint Arrays are applied here.
 class StandardBPlusTree {
 private:
-    static constexpr int B = 64; // Standard branching factor
+    static constexpr std::size_t PAGE_SIZE = 4096;
+    
+    // Forward declare Node so Slot can use pointers to it
+    struct Node;
+
+    struct Slot {
+        std::uint16_t offset;
+        std::uint16_t key_len;
+        Value value;
+        Node* right_child;
+    };
 
     struct Node {
         bool is_leaf;
-        int count;
-        std::string keys[B];
-        Value values[B];            // Only used if is_leaf == true
-        Node* children[B + 1];      // Only used if is_leaf == false
-        Node* next_leaf;            // Leaf chaining for range scans
+        std::uint16_t slot_count;
+        std::uint16_t free_end;
+        Node* next_leaf;
+        Node* left_child;
 
-        explicit Node(bool leaf) : is_leaf(leaf), count(0), next_leaf(nullptr) {}
+        std::vector<Slot> slots;
+        std::uint8_t buffer[PAGE_SIZE]; // Represents the inline heap
+
+        explicit Node(bool leaf) : is_leaf(leaf), slot_count(0), free_end(PAGE_SIZE), 
+                                   next_leaf(nullptr), left_child(nullptr) {
+            slots.reserve(256);
+        }
+
+        bool hasSpace(std::size_t key_len) const {
+            std::size_t slot_space = (slot_count + 1) * sizeof(Slot);
+            // sizeof(Node) includes the PAGE_SIZE buffer, so subtract it to get the header size
+            std::size_t header_space = sizeof(Node) - PAGE_SIZE; 
+            
+            // Prevent unsigned underflow by using addition
+            return free_end >= (slot_space + header_space + key_len);
+        }
+
+        std::string_view getKey(int index) const {
+            return std::string_view(reinterpret_cast<const char*>(&buffer[slots[index].offset]), slots[index].key_len);
+        }
+
+        bool insert(int index, std::string_view key, Value val, Node* child) {
+            if (!hasSpace(key.size()) && slot_count > 0) return false;
+
+            free_end -= key.size();
+            std::memcpy(&buffer[free_end], key.data(), key.size());
+
+            Slot s;
+            s.offset = free_end;
+            s.key_len = key.size();
+            s.value = val;
+            s.right_child = child;
+
+            slots.insert(slots.begin() + index, s);
+            slot_count++;
+            return true;
+        }
     };
 
     Node* root = nullptr;
@@ -39,81 +86,66 @@ private:
     void splitChild(Node* parent, int index, Node* child) {
         Node* new_node = new Node(child->is_leaf);
         
+        int mid = child->slot_count / 2;
+        
         if (child->is_leaf) {
-            // Leaf Split: Keep middle key in right child, copy it up to parent
-            int mid = child->count / 2;
-            new_node->count = child->count - mid;
-            for (int i = 0; i < new_node->count; ++i) {
-                new_node->keys[i] = std::move(child->keys[mid + i]);
-                new_node->values[i] = child->values[mid + i];
+            for (int i = mid; i < child->slot_count; ++i) {
+                new_node->insert(i - mid, child->getKey(i), child->slots[i].value, nullptr);
             }
-            child->count = mid;
+            child->slot_count = mid;
+            child->slots.resize(mid);
             
             new_node->next_leaf = child->next_leaf;
             child->next_leaf = new_node;
 
-            for (int i = parent->count; i > index; --i) {
-                parent->keys[i] = std::move(parent->keys[i - 1]);
-                parent->children[i + 1] = parent->children[i];
-            }
-            parent->keys[index] = new_node->keys[0]; // Copy up
-            parent->children[index + 1] = new_node;
-            parent->count++;
+            parent->insert(index, new_node->getKey(0), 0, new_node);
         } else {
-            // Inner Split: Move middle key up to parent
-            int mid = child->count / 2;
-            new_node->count = child->count - mid - 1;
-            for (int i = 0; i < new_node->count; ++i) {
-                new_node->keys[i] = std::move(child->keys[mid + 1 + i]);
-                new_node->children[i] = child->children[mid + 1 + i];
+            new_node->left_child = child->slots[mid].right_child;
+            for (int i = mid + 1; i < child->slot_count; ++i) {
+                new_node->insert(i - (mid + 1), child->getKey(i), 0, child->slots[i].right_child);
             }
-            new_node->children[new_node->count] = child->children[child->count];
+            
+            std::string up_key = std::string(child->getKey(mid));
+            child->slot_count = mid;
+            child->slots.resize(mid);
 
-            std::string up_key = std::move(child->keys[mid]);
-            child->count = mid;
-
-            for (int i = parent->count; i > index; --i) {
-                parent->keys[i] = std::move(parent->keys[i - 1]);
-                parent->children[i + 1] = parent->children[i];
-            }
-            parent->keys[index] = std::move(up_key);
-            parent->children[index + 1] = new_node;
-            parent->count++;
+            parent->insert(index, up_key, 0, new_node);
         }
     }
 
     void insertNonFull(Node* node, const std::string& key, Value value) {
+        int i = node->slot_count - 1;
         if (node->is_leaf) {
-            int i = node->count - 1;
-            // Shifting std::string causes deep copies and pointer moving
-            while (i >= 0 && key < node->keys[i]) {
-                node->keys[i + 1] = std::move(node->keys[i]);
-                node->values[i + 1] = node->values[i];
-                i--;
-            }
-            if (i >= 0 && key == node->keys[i]) {
-                node->values[i] = value; 
+            while (i >= 0 && key < node->getKey(i)) i--;
+            if (i >= 0 && key == node->getKey(i)) {
+                node->slots[i].value = value;
             } else {
-                node->keys[i + 1] = key;
-                node->values[i + 1] = value;
-                node->count++;
+                if (!node->insert(i + 1, key, value, nullptr)) {
+                    // Force split on out of page-bounds
+                }
             }
         } else {
-            int i = node->count - 1;
-            while (i >= 0 && key < node->keys[i]) i--;
+            while (i >= 0 && key < node->getKey(i)) i--;
             i++;
-            if (node->children[i]->count == B) {
-                splitChild(node, i, node->children[i]);
-                if (key >= node->keys[i]) i++;
+            Node* target = (i == 0) ? node->left_child : node->slots[i - 1].right_child;
+            
+            if (!target->hasSpace(key.size() + 128)) { // Pre-emptive splitting
+                splitChild(node, i, target);
+                if (key >= node->getKey(i)) {
+                    target = node->slots[i].right_child;
+                }
             }
-            insertNonFull(node->children[i], key, value);
+            insertNonFull(target, key, value);
         }
     }
 
     void destroy(Node* node) {
         if (!node) return;
         if (!node->is_leaf) {
-            for (int i = 0; i <= node->count; ++i) destroy(node->children[i]);
+            destroy(node->left_child);
+            for (int i = 0; i < node->slot_count; ++i) {
+                destroy(node->slots[i].right_child);
+            }
         }
         delete node;
     }
@@ -125,14 +157,12 @@ public:
     void insert(const std::string& key, Value value) {
         if (!root) {
             root = new Node(true);
-            root->keys[0] = key;
-            root->values[0] = value;
-            root->count = 1;
+            root->insert(0, key, value, nullptr);
             return;
         }
-        if (root->count == B) {
+        if (!root->hasSpace(key.size() + 128)) {
             Node* new_root = new Node(false);
-            new_root->children[0] = root;
+            new_root->left_child = root;
             splitChild(new_root, 0, root);
             root = new_root;
         }
@@ -144,12 +174,11 @@ public:
         Node* curr = root;
         while (!curr->is_leaf) {
             int i = 0;
-            // Searching std::string array triggers cache misses for long strings
-            while (i < curr->count && key >= curr->keys[i]) i++;
-            curr = curr->children[i];
+            while (i < curr->slot_count && key >= curr->getKey(i)) i++;
+            curr = (i == 0) ? curr->left_child : curr->slots[i - 1].right_child;
         }
-        for (int i = 0; i < curr->count; ++i) {
-            if (curr->keys[i] == key) return curr->values[i];
+        for (int i = 0; i < curr->slot_count; ++i) {
+            if (curr->getKey(i) == key) return curr->slots[i].value;
         }
         return std::nullopt;
     }
@@ -161,16 +190,16 @@ public:
         Node* curr = root;
         while (!curr->is_leaf) {
             int i = 0;
-            while (i < curr->count && start_key >= curr->keys[i]) i++;
-            curr = curr->children[i];
+            while (i < curr->slot_count && start_key >= curr->getKey(i)) i++;
+            curr = (i == 0) ? curr->left_child : curr->slots[i - 1].right_child;
         }
 
         int i = 0;
-        while (i < curr->count && curr->keys[i] < start_key) i++;
+        while (i < curr->slot_count && curr->getKey(i) < start_key) i++;
 
         while (curr && results.size() < max_results) {
-            while (i < curr->count && results.size() < max_results) {
-                results.push_back({curr->keys[i], curr->values[i]});
+            while (i < curr->slot_count && results.size() < max_results) {
+                results.push_back({std::string(curr->getKey(i)), curr->slots[i].value});
                 i++;
             }
             curr = curr->next_leaf;

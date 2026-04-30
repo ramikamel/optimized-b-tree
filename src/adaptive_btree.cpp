@@ -6,39 +6,10 @@
 
 namespace abt
 {
-    namespace
-    {
-
-        template <typename EntryType>
-        std::string commonPrefixInRange(const std::vector<EntryType> &entries,
-                                        std::size_t begin,
-                                        std::size_t end)
-        {
-            if (begin >= end)
-            {
-                return "";
-            }
-
-            std::string prefix = entries[begin].key;
-            for (std::size_t i = begin + 1; i < end && !prefix.empty(); ++i)
-            {
-                const std::string &key = entries[i].key;
-                std::size_t len = 0;
-                const std::size_t max_len = std::min(prefix.size(), key.size());
-                while (len < max_len && prefix[len] == key[len])
-                {
-                    ++len;
-                }
-                prefix.resize(len);
-            }
-            return prefix;
-        }
-
-    } // namespace
 
     AdaptiveBTree::AdaptiveBTree(FeatureFlags features) : features_(features)
     {
-        nodes_.resize(100000); // Pre-allocate capacity to avoid constant reallocations
+        nodes_.resize(100000); 
         root_id_ = allocateLeaf();
     }
 
@@ -65,10 +36,7 @@ namespace abt
             ++height_;
         }
 
-        if (inserted_new)
-        {
-            ++size_;
-        }
+        if (inserted_new) ++size_;
         return inserted_new;
     }
 
@@ -91,7 +59,6 @@ namespace abt
             const std::uint16_t count = leaf->slotCount(); 
 
             std::uint16_t i = 0;
-            // Instantly jump to the target key on the first leaf using binary search
             if (first_leaf) {
                 i = static_cast<std::uint16_t>(leaf->lowerBoundIndex(start_key));
                 first_leaf = false;
@@ -101,27 +68,19 @@ namespace abt
                 results.push_back(KeyValue{leaf->keyAt(i), leaf->valueAt(i)});
                 if (results.size() >= max_results) break;
             }
-
             leaf_id = leaf->nextLeaf();
         }
 
         return results;
     }
 
-    std::size_t AdaptiveBTree::size() const
-    {
-        return size_;
-    }
-
-    std::size_t AdaptiveBTree::height() const
-    {
-        return height_;
-    }
+    std::size_t AdaptiveBTree::size() const { return size_; }
+    std::size_t AdaptiveBTree::height() const { return height_; }
 
     NodeId AdaptiveBTree::allocateLeaf()
     {
         const NodeId id = next_node_id_++;
-        if (id >= nodes_.size()) nodes_.resize(id * 2); // Resize vector if needed
+        if (id >= nodes_.size()) nodes_.resize(id * 2); 
         nodes_[id] = std::make_unique<LeafNode>(id);
         return id;
     }
@@ -129,68 +88,17 @@ namespace abt
     NodeId AdaptiveBTree::allocateInner()
     {
         const NodeId id = next_node_id_++;
-        if (id >= nodes_.size()) nodes_.resize(id * 2); // Resize vector if needed
+        if (id >= nodes_.size()) nodes_.resize(id * 2);
         nodes_[id] = std::make_unique<InnerNode>(id);
         return id;
     }
 
-    Node *AdaptiveBTree::getNode(NodeId id)
-    {
-        if (id >= nodes_.size() || !nodes_[id])
-        {
-            throw std::out_of_range("node id not found");
-        }
-        return nodes_[id].get();
-    }
-
-    const Node *AdaptiveBTree::getNode(NodeId id) const
-    {
-        if (id >= nodes_.size() || !nodes_[id])
-        {
-            throw std::out_of_range("node id not found");
-        }
-        return nodes_[id].get();
-    }
-
-    LeafNode *AdaptiveBTree::getLeaf(NodeId id)
-    {
-        Node *node = getNode(id);
-        if (!node->isLeaf())
-        {
-            throw std::logic_error("node is not a leaf");
-        }
-        return static_cast<LeafNode *>(node);
-    }
-
-    const LeafNode *AdaptiveBTree::getLeaf(NodeId id) const
-    {
-        const Node *node = getNode(id);
-        if (!node->isLeaf())
-        {
-            throw std::logic_error("node is not a leaf");
-        }
-        return static_cast<const LeafNode *>(node);
-    }
-
-    InnerNode *AdaptiveBTree::getInner(NodeId id)
-    {
-        Node *node = getNode(id);
-        if (node->isLeaf())
-        {
-            throw std::logic_error("node is not an inner node");
-        }
-        return static_cast<InnerNode *>(node);
-    }
-
-    const InnerNode *AdaptiveBTree::getInner(NodeId id) const
-    {
-        const Node *node = getNode(id);
-        if (node->isLeaf())
-        {
-            throw std::logic_error("node is not an inner node");
-        }
-        return static_cast<const InnerNode *>(node);
-    }
+    Node *AdaptiveBTree::getNode(NodeId id) { return nodes_[id].get(); }
+    const Node *AdaptiveBTree::getNode(NodeId id) const { return nodes_[id].get(); }
+    LeafNode *AdaptiveBTree::getLeaf(NodeId id) { return static_cast<LeafNode *>(getNode(id)); }
+    const LeafNode *AdaptiveBTree::getLeaf(NodeId id) const { return static_cast<const LeafNode *>(getNode(id)); }
+    InnerNode *AdaptiveBTree::getInner(NodeId id) { return static_cast<InnerNode *>(getNode(id)); }
+    const InnerNode *AdaptiveBTree::getInner(NodeId id) const { return static_cast<const InnerNode *>(getNode(id)); }
 
     std::optional<AdaptiveBTree::SplitResult> AdaptiveBTree::insertRecursive(NodeId node_id,
                                                                              const std::string &key,
@@ -203,51 +111,89 @@ namespace abt
         {
             LeafNode *leaf = static_cast<LeafNode *>(node);
 
-            // --- OPTIMIZATION: Try fast in-place insert first! ---
-            if (leaf->tryInsertInPlace(key, value, *inserted_new))
-            {
+            if (leaf->tryInsertInPlace(key, value, *inserted_new)) {
                 return std::nullopt;
             }
 
-            // --- FALLBACK: Rebuild and Split if page is full or prefix doesn't match ---
-            std::vector<LeafEntry> entries = leaf->entries();
+            std::vector<LeafEntryView> views = leaf->entryViews();
+            std::string_view old_prefix = leaf->prefixView();
 
-            auto it = std::lower_bound(entries.begin(), entries.end(), key, [](const LeafEntry &lhs, const std::string &rhs)
-                                       { return lhs.key < rhs; });
+            auto it = std::lower_bound(views.begin(), views.end(), key,
+                [&](const LeafEntryView &lhs, const std::string &rhs) {
+                    std::string_view rhs_view(rhs);
+                    std::size_t common_len = std::min(old_prefix.size(), rhs_view.size());
+                    
+                    if (common_len > 0) {
+                        int cmp = std::char_traits<char>::compare(old_prefix.data(), rhs_view.data(), common_len);
+                        if (cmp != 0) return cmp < 0;
+                    }
+                    if (rhs_view.size() < old_prefix.size()) return false;
+                    
+                    std::string_view lhs_suffix = lhs.key;
+                    std::string_view rhs_suffix = rhs_view.substr(old_prefix.size());
+                    return lexical_compare(lhs_suffix, rhs_suffix) < 0;
+                });
 
-            if (it != entries.end() && it->key == key)
-            {
-                it->value = value;
-                *inserted_new = false;
+            bool found = false;
+            if (it != views.end()) {
+                std::string full_lhs;
+                if (it->is_new) full_lhs = key;
+                else {
+                    full_lhs = std::string(old_prefix);
+                    full_lhs.append(it->key);
+                }
+                if (full_lhs == key) {
+                    it->value = value;
+                    *inserted_new = false;
+                    found = true;
+                }
             }
-            else
-            {
-                entries.insert(it, LeafEntry{key, value});
+            
+            if (!found) {
+                views.insert(it, LeafEntryView{key, value, true});
                 *inserted_new = true;
             }
 
-            if (leaf->rebuild(entries))
-            {
+            if (leaf->rebuildFromViews(views, key)) {
                 return std::nullopt;
             }
 
-            const std::size_t split_index = chooseLeafSplitIndex(entries);
-            const std::vector<LeafEntry> left(entries.begin(), entries.begin() + split_index);
-            const std::vector<LeafEntry> right(entries.begin() + split_index, entries.end());
+            std::size_t total_bytes = 0;
+            for (const auto& e : views) {
+                total_bytes += e.is_new ? key.size() : old_prefix.size() + e.key.size();
+            }
+            
+            std::size_t current_bytes = 0;
+            std::size_t split_index = views.size() / 2;
+            for (std::size_t i = 0; i < views.size(); ++i) {
+                current_bytes += views[i].is_new ? key.size() : old_prefix.size() + views[i].key.size();
+                if (current_bytes >= total_bytes / 2) {
+                    split_index = std::max<std::size_t>(1, i);
+                    break;
+                }
+            }
+
+            const std::vector<LeafEntryView> left(views.begin(), views.begin() + split_index);
+            const std::vector<LeafEntryView> right(views.begin() + split_index, views.end());
 
             const NodeId right_id = allocateLeaf();
             LeafNode *right_leaf = getLeaf(right_id);
-
             const NodeId old_next = leaf->nextLeaf();
-            if (!leaf->rebuild(left) || !right_leaf->rebuild(right))
-            {
-                throw std::runtime_error("leaf split failed: split result does not fit in page");
-            }
+
+            leaf->rebuildFromViews(left, key);
+            right_leaf->rebuildFromViews(right, key);
 
             leaf->setNextLeaf(right_id);
             right_leaf->setNextLeaf(old_next);
 
-            return SplitResult{right.front().key, right_id};
+            std::string sep_key;
+            if (right.front().is_new) {
+                sep_key = key;
+            } else {
+                sep_key = std::string(old_prefix);
+                sep_key.append(right.front().key);
+            }
+            return SplitResult{sep_key, right_id};
         }
 
         InnerNode *inner = static_cast<InnerNode *>(node);
@@ -255,43 +201,58 @@ namespace abt
         const NodeId child_id = inner->childAt(child_index);
 
         const std::optional<SplitResult> child_split = insertRecursive(child_id, key, value, inserted_new);
-        if (!child_split.has_value())
-        {
+        if (!child_split.has_value()) {
             return std::nullopt;
         }
 
-        // --- OPTIMIZATION: Try fast in-place inner insert! ---
-        if (inner->tryInsertInPlace(child_split->separator_key, child_split->right_node))
-        {
+        if (inner->tryInsertInPlace(child_split->separator_key, child_split->right_node)) {
             return std::nullopt;
         }
 
-        // --- FALLBACK: Rebuild and split inner node ---
-        InnerMaterialized state = inner->materialize();
+        InnerMaterializedView state = inner->materializeViews();
+        std::string_view old_prefix = inner->prefixView();
+
         state.entries.insert(state.entries.begin() + child_index,
-                             InnerEntry{child_split->separator_key, child_split->right_node});
+                             InnerEntryView{child_split->separator_key, child_split->right_node, true});
 
-        if (inner->rebuild(state.left_child, state.entries))
-        {
+        if (inner->rebuildFromViews(state.left_child, state.entries, child_split->separator_key)) {
             return std::nullopt;
         }
 
-        const std::size_t split_index = chooseInnerSplitIndex(state.entries);
-        const InnerEntry promoted = state.entries[split_index];
+        std::size_t total_bytes = 0;
+        for (const auto& e : state.entries) {
+            total_bytes += e.is_new ? child_split->separator_key.size() : old_prefix.size() + e.key.size();
+        }
+        
+        std::size_t current_bytes = 0;
+        std::size_t split_index = state.entries.size() / 2;
+        for (std::size_t i = 0; i < state.entries.size(); ++i) {
+            current_bytes += state.entries[i].is_new ? child_split->separator_key.size() : old_prefix.size() + state.entries[i].key.size();
+            if (current_bytes >= total_bytes / 2) {
+                split_index = std::max<std::size_t>(0, i);
+                break;
+            }
+        }
 
-        const std::vector<InnerEntry> left(state.entries.begin(), state.entries.begin() + split_index);
+        const InnerEntryView promoted = state.entries[split_index];
+        const std::vector<InnerEntryView> left(state.entries.begin(), state.entries.begin() + split_index);
         const NodeId right_left_child = promoted.right_child;
-        const std::vector<InnerEntry> right(state.entries.begin() + split_index + 1, state.entries.end());
+        const std::vector<InnerEntryView> right(state.entries.begin() + split_index + 1, state.entries.end());
 
         const NodeId right_id = allocateInner();
         InnerNode *right_inner = getInner(right_id);
 
-        if (!inner->rebuild(state.left_child, left) || !right_inner->rebuild(right_left_child, right))
-        {
-            throw std::runtime_error("inner split failed: split result does not fit in page");
-        }
+        inner->rebuildFromViews(state.left_child, left, child_split->separator_key);
+        right_inner->rebuildFromViews(right_left_child, right, child_split->separator_key);
 
-        return SplitResult{promoted.key, right_id};
+        std::string sep_key;
+        if (promoted.is_new) {
+            sep_key = child_split->separator_key;
+        } else {
+            sep_key = std::string(old_prefix);
+            sep_key.append(promoted.key);
+        }
+        return SplitResult{sep_key, right_id};
     }
 
     NodeId AdaptiveBTree::findLeafForKey(std::string_view key) const
@@ -303,78 +264,6 @@ namespace abt
             current = inner->childForKey(key);
         }
         return current;
-    }
-
-    std::size_t AdaptiveBTree::chooseLeafSplitIndex(const std::vector<LeafEntry> &entries) {
-        if (entries.size() < 2) return 1;
-        
-        // O(N) single-pass byte counting instead of O(N^2) string allocations
-        std::size_t total_bytes = 0;
-        for (const auto& e : entries) total_bytes += e.key.size() + sizeof(Value);
-        
-        std::size_t current_bytes = 0;
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            current_bytes += entries[i].key.size() + sizeof(Value);
-            if (current_bytes >= total_bytes / 2) return std::max<std::size_t>(1, i);
-        }
-        return entries.size() / 2;
-    }
-
-    std::size_t AdaptiveBTree::chooseInnerSplitIndex(const std::vector<InnerEntry> &entries) {
-        if (entries.size() < 2) return 0;
-        
-        std::size_t total_bytes = 0;
-        for (const auto& e : entries) total_bytes += e.key.size() + sizeof(NodeId);
-        
-        std::size_t current_bytes = 0;
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            current_bytes += entries[i].key.size() + sizeof(NodeId);
-            if (current_bytes >= total_bytes / 2) return std::max<std::size_t>(0, i);
-        }
-        return entries.size() / 2;
-    }
-
-    std::size_t AdaptiveBTree::estimateLeafBytes(const std::vector<LeafEntry> &entries,
-                                                 std::size_t begin,
-                                                 std::size_t end)
-    {
-        if (begin >= end)
-        {
-            return std::numeric_limits<std::size_t>::max();
-        }
-
-        const std::string prefix = commonPrefixInRange(entries, begin, end);
-
-        // Slotted page sizing math:
-        // header + node-prefix + sum(slot metadata + suffix bytes + payload bytes).
-        std::size_t bytes = sizeof(SlottedPage::Header) + prefix.size();
-        for (std::size_t i = begin; i < end; ++i)
-        {
-            const std::size_t suffix_len = entries[i].key.size() - prefix.size();
-            bytes += sizeof(SlottedPage::LeafSlot) + suffix_len + sizeof(Value);
-        }
-        return bytes;
-    }
-
-    std::size_t AdaptiveBTree::estimateInnerBytes(const std::vector<InnerEntry> &entries,
-                                                  std::size_t begin,
-                                                  std::size_t end)
-    {
-        if (begin >= end)
-        {
-            return sizeof(SlottedPage::Header);
-        }
-
-        const std::string prefix = commonPrefixInRange(entries, begin, end);
-
-        // Inner pages omit payload values and store right-child ids in slot metadata.
-        std::size_t bytes = sizeof(SlottedPage::Header) + prefix.size();
-        for (std::size_t i = begin; i < end; ++i)
-        {
-            const std::size_t suffix_len = entries[i].key.size() - prefix.size();
-            bytes += sizeof(SlottedPage::InnerSlot) + suffix_len;
-        }
-        return bytes;
     }
 
 } // namespace abt

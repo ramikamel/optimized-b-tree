@@ -67,6 +67,10 @@ namespace abt
         bool insertLeaf(std::uint16_t pos, std::string_view key_suffix, Value value, std::uint16_t hint);
         bool insertInner(std::uint16_t pos, std::string_view key_suffix, NodeId right_child, std::uint16_t hint);
 
+        // Zero-allocation 2-part inserts
+        bool insertLeaf(std::uint16_t pos, std::string_view p1, std::string_view p2, Value value, std::uint16_t hint);
+        bool insertInner(std::uint16_t pos, std::string_view p1, std::string_view p2, NodeId right_child, std::uint16_t hint);
+
         std::string_view keySuffix(std::uint16_t index) const;
         std::uint16_t hintAt(std::uint16_t index) const;
 
