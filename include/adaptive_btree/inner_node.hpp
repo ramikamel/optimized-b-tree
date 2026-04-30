@@ -1,61 +1,47 @@
 #pragma once
 
-#include <cstddef>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "adaptive_btree/node.hpp"
 
 namespace abt
 {
 
-    struct InnerEntry
-    {
-        std::string key;
-        NodeId right_child;
-    };
-
-    struct InnerEntryView {
-        std::string_view key;
-        NodeId right_child;
-        bool is_new;
-    };
-
-    struct InnerMaterialized
-    {
-        NodeId left_child;
-        std::vector<InnerEntry> entries;
-    };
-
-    struct InnerMaterializedView
-    {
-        NodeId left_child;
-        std::vector<InnerEntryView> entries;
-    };
-
     class InnerNode final : public Node
     {
     public:
-        explicit InnerNode(NodeId id);
+        explicit InnerNode(NodeId id) : Node(id, NodeType::kInner) {}
 
-        InnerMaterialized materialize() const;
-        bool rebuild(NodeId left_child, const std::vector<InnerEntry> &sorted_entries);
+        // Reset to empty with the given fences. Caller must then setLeftChild()
+        // and append separators/right_children.
+        void initEmpty(std::string_view lower_fence, std::string_view upper_fence, NodeId left_child);
 
-        InnerMaterializedView materializeViews() const;
-        bool rebuildFromViews(NodeId left_child, const std::vector<InnerEntryView> &sorted_entries, std::string_view new_key);
+        // Initialize this node as a fresh root holding (left_child, sep, right_child).
+        void initRoot(NodeId left_child, std::string_view separator_full_key, NodeId right_child);
 
-        std::size_t childIndexForKey(std::string_view key) const;
-        NodeId childAt(std::size_t child_index) const;
-        NodeId childForKey(std::string_view key) const;
-        std::string_view prefixView() const;
+        // Try to insert a separator + right child without splitting.
+        bool tryInsertSeparator(std::string_view separator_full_key, NodeId right_child);
 
-        bool tryInsertInPlace(std::string_view key, NodeId right_child);
+        // Routing: returns the index in [0, slotCount] that picks the correct
+        // child for `key` (0 -> leftChild, k+1 -> rightChild(k)).
+        std::uint16_t childIndexForKey(std::string_view key) const;
+        NodeId childAt(std::uint16_t child_index) const;
+        NodeId childForKey(std::string_view key) const { return childAt(childIndexForKey(key)); }
 
-    private:
-        int compareKeyAt(std::uint16_t slot_index, std::string_view key) const;
-        static std::string commonPrefix(const std::vector<InnerEntry> &sorted_entries);
-        static std::string commonPrefixFromViews(const std::vector<InnerEntryView> &sorted_entries, std::string_view new_key, std::string_view old_prefix);
+        std::uint16_t slotCount() const { return page_.slotCount(); }
+        std::string_view keySuffix(std::uint16_t i) const { return page_.keySuffix(i); }
+        std::string_view prefixView() const { return page_.prefixView(); }
+        NodeId rightChild(std::uint16_t i) const { return page_.rightChild(i); }
+        NodeId leftChild() const { return page_.link(); }
+        void setLeftChild(NodeId id) { page_.setLink(id); }
+
+        // Split this inner node and promote the median key (paper §2):
+        //   - left keeps slots [0, mid) and its current leftChild
+        //   - right (freshly allocated) gets leftChild = src.rightChild(mid),
+        //     and slots [mid+1, n)
+        //   - the median full key is returned and disappears from both children
+        std::string splitInto(InnerNode& right_node);
     };
 
 } // namespace abt

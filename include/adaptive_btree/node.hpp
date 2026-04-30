@@ -6,18 +6,18 @@
 namespace abt
 {
 
+    // Thin wrapper carrying a stable NodeId plus a 4 KiB page.
     class Node
     {
     public:
-        Node(NodeId id, NodeType type);
-        virtual ~Node() = default;
+        Node(NodeId id, NodeType type) : id_(id) { page_.init(type, {}, {}); }
 
-        NodeId id() const;
-        NodeType type() const;
-        bool isLeaf() const;
+        NodeId id() const { return id_; }
+        NodeType type() const { return page_.type(); }
+        bool isLeaf() const { return type() == NodeType::kLeaf; }
 
-        const SlottedPage &page() const;
-        SlottedPage &page();
+        SlottedPage& page() { return page_; }
+        const SlottedPage& page() const { return page_; }
 
     protected:
         NodeId id_;

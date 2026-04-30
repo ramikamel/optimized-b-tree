@@ -1,253 +1,207 @@
 #include "adaptive_btree/leaf_node.hpp"
 
 #include <algorithm>
-#include <utility>
-
-#include "adaptive_btree/common.hpp"
+#include <cstring>
 
 namespace abt
 {
 
-    LeafNode::LeafNode(NodeId id) : Node(id, NodeType::kLeaf) {}
-
-    std::vector<LeafEntry> LeafNode::entries() const
+    namespace
     {
-        std::vector<LeafEntry> out;
-        out.reserve(page_.slotCount());
-        const std::string prefix = page_.prefix();
-
-        for (std::uint16_t i = 0; i < page_.slotCount(); ++i)
-        {
-            std::string key = prefix;
-            key.append(page_.keySuffix(i));
-            out.push_back(LeafEntry{std::move(key), page_.leafValue(i)});
-        }
-        return out;
+        // A single thread-local scratch page used as a build target during splits.
+        // Reused across calls; SlottedPage::init() resets it cheaply (no 4 KiB memset).
+        thread_local SlottedPage tls_scratch;
     }
 
-    std::vector<LeafEntryView> LeafNode::entryViews() const {
-        std::vector<LeafEntryView> out;
-        out.reserve(page_.slotCount() + 1);
-        for (std::uint16_t i = 0; i < page_.slotCount(); ++i) {
-            out.push_back({page_.keySuffix(i), page_.leafValue(i), false});
-        }
-        return out;
-    }
-
-    bool LeafNode::rebuild(const std::vector<LeafEntry> &sorted_entries)
+    void LeafNode::initEmpty(std::string_view lower_fence, std::string_view upper_fence, NodeId next_leaf)
     {
-        NodeId old_next = page_.nextLeaf();
-        SlottedPage candidate(NodeType::kLeaf);
-        const std::string prefix = commonPrefix(sorted_entries);
-        candidate.setPrefix(prefix);
+        page_.init(NodeType::kLeaf, lower_fence, upper_fence);
+        page_.setLink(next_leaf);
+    }
 
-        for (std::uint16_t i = 0; i < sorted_entries.size(); ++i)
+    bool LeafNode::tryInsert(std::string_view key, Value value, bool& inserted_new)
+    {
+        // Static prefix truncation invariant: any key reaching this leaf must
+        // share the (statically computed) prefix of the leaf, because routing
+        // and splits guarantee the key lies between the leaf's fences.
+        const std::size_t prefix_len = page_.prefixLen();
+        const std::string_view suffix(key.data() + prefix_len, key.size() - prefix_len);
+        const std::uint32_t head = make_head(suffix);
+
+        // Tail-insert fast path: sorted/sequential workloads hit this almost
+        // always. A single head compare (and rarely a suffix compare) beats a
+        // full hint+binary-search.
+        const std::uint16_t n = page_.slotCount();
+        if (__builtin_expect(n > 0, 1))
         {
-            const std::string_view key = sorted_entries[i].key;
-            const std::string_view suffix = key.substr(prefix.size());
-            const std::uint16_t hint = make_prefix_hint(suffix);
-            if (!candidate.insertLeaf(i, suffix, sorted_entries[i].value, hint)) return false;
-        }
-
-        candidate.setNextLeaf(old_next);
-        page_ = std::move(candidate);
-        return true;
-    }
-
-    std::string LeafNode::commonPrefixFromViews(const std::vector<LeafEntryView> &sorted_entries, std::string_view new_key, std::string_view old_prefix) {
-        if (sorted_entries.empty()) return "";
-        
-        const auto& first_e = sorted_entries.front();
-        const auto& last_e = sorted_entries.back();
-        
-        std::string prefix;
-        std::size_t i = 0;
-        while (true) {
-            char c1, c2;
-            
-            if (first_e.is_new) {
-                if (i >= new_key.size()) break;
-                c1 = new_key[i];
-            } else {
-                if (i < old_prefix.size()) c1 = old_prefix[i];
-                else if (i - old_prefix.size() < first_e.key.size()) c1 = first_e.key[i - old_prefix.size()];
-                else break;
+            const std::uint16_t last_idx = static_cast<std::uint16_t>(n - 1);
+            const std::uint32_t last_head = page_.headAt(last_idx);
+            if (__builtin_expect(head > last_head ||
+                    (head == last_head && suffix > page_.keySuffix(last_idx)), 1))
+            {
+                if (!page_.hasSpaceForLeaf(suffix.size())) return false;
+                page_.appendLeaf(suffix, value, head);
+                // The new slot is past every hint sample point unless the slot
+                // count crosses a spacing boundary, in which case rebuild.
+                if ((n / (kHintCount + 1)) != ((n + 1) / (kHintCount + 1))) page_.rebuildHints();
+                inserted_new = true;
+                return true;
             }
-            
-            if (last_e.is_new) {
-                if (i >= new_key.size()) break;
-                c2 = new_key[i];
-            } else {
-                if (i < old_prefix.size()) c2 = old_prefix[i];
-                else if (i - old_prefix.size() < last_e.key.size()) c2 = last_e.key[i - old_prefix.size()];
-                else break;
-            }
-            
-            if (c1 != c2) break;
-            prefix.push_back(c1);
-            ++i;
         }
-        return prefix;
-    }
-
-    bool LeafNode::rebuildFromViews(const std::vector<LeafEntryView> &sorted_entries, std::string_view new_key) {
-        NodeId old_next = page_.nextLeaf();
-        SlottedPage candidate(NodeType::kLeaf);
-        
-        std::string_view old_prefix = page_.prefixView();
-        std::string prefix = commonPrefixFromViews(sorted_entries, new_key, old_prefix);
-        candidate.setPrefix(prefix);
-
-        for (std::uint16_t i = 0; i < sorted_entries.size(); ++i) {
-            std::string_view p1, p2;
-            if (sorted_entries[i].is_new) {
-                std::size_t start = std::min(prefix.size(), new_key.size());
-                p1 = std::string_view(new_key).substr(start);
-            } else {
-                if (prefix.size() <= old_prefix.size()) {
-                    std::size_t start = std::min(prefix.size(), old_prefix.size());
-                    p1 = old_prefix.substr(start);
-                    p2 = sorted_entries[i].key;
-                } else {
-                    std::size_t eat = prefix.size() - old_prefix.size();
-                    eat = std::min(eat, sorted_entries[i].key.size()); // Safe clamp
-                    p1 = sorted_entries[i].key.substr(eat);
-                }
-            }
-            
-            char buf[4] = {0, 0, 0, 0};
-            std::size_t n1 = std::min<std::size_t>(4, p1.size());
-            std::memcpy(buf, p1.data(), n1);
-            std::size_t n2 = std::min<std::size_t>(4 - n1, p2.size());
-            std::memcpy(buf + n1, p2.data(), n2);
-            std::uint16_t hint = make_prefix_hint(std::string_view(buf, n1 + n2));
-
-            if (!candidate.insertLeaf(i, p1, p2, sorted_entries[i].value, hint)) return false;
+        // Slow path: out-of-order insert (or first-ever insert into the leaf).
+        const std::uint16_t idx = (n == 0) ? std::uint16_t{0} : page_.lowerBoundIndex(head, suffix);
+        if (idx < n && page_.keySuffix(idx) == suffix)
+        {
+            page_.setLeafValue(idx, value);
+            inserted_new = false;
+            return true;
         }
-
-        candidate.setNextLeaf(old_next);
-        page_ = std::move(candidate);
+        if (!page_.insertLeaf(idx, suffix, value, head)) return false;
+        page_.rebuildHints();
+        inserted_new = true;
         return true;
     }
 
     std::optional<Value> LeafNode::find(std::string_view key) const
     {
-        const std::size_t index = lowerBoundIndex(key);
-        if (index >= page_.slotCount()) return std::nullopt;
+        const std::size_t prefix_len = page_.prefixLen();
+        if (key.size() < prefix_len) return std::nullopt;
+        const std::string_view suffix(key.data() + prefix_len, key.size() - prefix_len);
+        const std::uint32_t head = make_head(suffix);
 
-        if (compareKeyAt(static_cast<std::uint16_t>(index), key) == 0) {
-            return page_.leafValue(static_cast<std::uint16_t>(index));
+        const std::uint16_t idx = page_.lowerBoundIndex(head, suffix);
+        if (idx < page_.slotCount() && page_.keySuffix(idx) == suffix)
+        {
+            return page_.leafValue(idx);
         }
         return std::nullopt;
     }
 
-    std::size_t LeafNode::lowerBoundIndex(std::string_view key) const {
-        std::size_t lo = 0;
-        std::size_t hi = page_.slotCount();
-
-        const std::string_view prefix = page_.prefixView();
-        
-        bool can_use_hint = false;
-        if (key.size() >= prefix.size() && prefix.size() > 0) {
-            if (std::char_traits<char>::compare(key.data(), prefix.data(), prefix.size()) == 0) {
-                can_use_hint = true;
-            }
-        } else if (prefix.empty()) {
-            can_use_hint = true;
-        }
-
-        std::uint16_t target_hint = 0;
-        if (can_use_hint) {
-            target_hint = make_prefix_hint(key.substr(prefix.size()));
-        }
-
-        while (lo < hi) {
-            const std::size_t mid = lo + ((hi - lo) / 2);
-            int cmp = 0;
-            if (can_use_hint) {
-                const std::uint16_t slot_hint = page_.hintAt(static_cast<std::uint16_t>(mid));
-                if (target_hint < slot_hint) cmp = 1;
-                else if (target_hint > slot_hint) cmp = -1;
-                else cmp = compareKeyAt(static_cast<std::uint16_t>(mid), key);
-            } else {
-                cmp = compareKeyAt(static_cast<std::uint16_t>(mid), key);
-            }
-            if (cmp < 0) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    NodeId LeafNode::nextLeaf() const { return page_.nextLeaf(); }
-    void LeafNode::setNextLeaf(NodeId id) { page_.setNextLeaf(id); }
-    std::string_view LeafNode::prefixView() const { return page_.prefixView(); }
-
-    int LeafNode::compareKeyAt(std::uint16_t slot_index, std::string_view key) const {
-        const std::string_view prefix_view = page_.prefixView();
-        const std::size_t prefix_common = std::min(prefix_view.size(), key.size());
-        
-        if (prefix_common > 0) {
-            const int prefix_cmp = std::char_traits<char>::compare(prefix_view.data(), key.data(), prefix_common);
-            if (prefix_cmp < 0) return -1;
-            if (prefix_cmp > 0) return 1;
-        }
-        if (key.size() < prefix_view.size()) return 1;
-
-        const std::string_view suffix = page_.keySuffix(slot_index);
-        const std::string_view key_suffix = key.substr(prefix_view.size());
-        return lexical_compare(suffix, key_suffix);
-    }
-
-    std::string LeafNode::commonPrefix(const std::vector<LeafEntry> &sorted_entries)
+    std::uint16_t LeafNode::lowerBoundIndex(std::string_view key) const
     {
-        if (sorted_entries.empty()) return "";
-        std::string prefix = sorted_entries.front().key;
-        for (std::size_t i = 1; i < sorted_entries.size() && !prefix.empty(); ++i) {
-            const std::string &key = sorted_entries[i].key;
-            std::size_t len = 0;
-            const std::size_t max_len = std::min(prefix.size(), key.size());
-            while (len < max_len && prefix[len] == key[len]) ++len;
-            prefix.resize(len);
+        const std::string_view prefix = page_.prefixView();
+        if (key.size() < prefix.size())
+        {
+            // Compare prefix vs key: if key < prefix, lower_bound is 0.
+            const int cmp = key.compare(prefix.substr(0, key.size()));
+            return cmp < 0 ? std::uint16_t{0} : page_.slotCount();
         }
-        return prefix;
+        const int pcmp = std::memcmp(key.data(), prefix.data(), prefix.size());
+        if (pcmp < 0) return 0;
+        if (pcmp > 0) return page_.slotCount();
+        const std::string_view suffix = key.substr(prefix.size());
+        return page_.lowerBoundIndex(make_head(suffix), suffix);
     }
 
-    bool LeafNode::tryInsertInPlace(std::string_view key, Value value, bool& inserted_new) {
-        std::size_t idx = lowerBoundIndex(key);
-        if (idx < page_.slotCount() && compareKeyAt(static_cast<std::uint16_t>(idx), key) == 0) {
-            page_.setLeafValue(static_cast<std::uint16_t>(idx), value);
-            inserted_new = false;
-            return true;
-        }
+    std::string LeafNode::keyAt(std::uint16_t i) const
+    {
+        const std::string_view prefix = page_.prefixView();
+        const std::string_view suffix = page_.keySuffix(i);
+        std::string out;
+        out.reserve(prefix.size() + suffix.size());
+        out.append(prefix);
+        out.append(suffix);
+        return out;
+    }
 
-        std::string_view prefix = page_.prefixView();
-        if (key.size() >= prefix.size()) {
-            bool match = true;
-            if (prefix.size() > 0) {
-                match = (std::char_traits<char>::compare(key.data(), prefix.data(), prefix.size()) == 0);
-            }
-            if (match) {
-                std::string_view suffix = key.substr(prefix.size());
-                std::uint16_t hint = make_prefix_hint(suffix);
-                if (page_.insertLeaf(static_cast<std::uint16_t>(idx), suffix, value, hint)) {
-                    inserted_new = true;
-                    return true;
+    std::string LeafNode::splitInto(LeafNode& right_node, NodeId right_id)
+    {
+        SlottedPage& src = page_;
+        const std::uint16_t n = src.slotCount();
+
+        // 1. Pick split index by accumulated payload bytes (not just key count)
+        //    so variable-length keys are balanced.
+        std::size_t total = 0;
+        for (std::uint16_t i = 0; i < n; ++i)
+            total += src.keySuffix(i).size() + sizeof(Value);
+
+        std::uint16_t mid = static_cast<std::uint16_t>(n / 2);
+        if (mid == 0) mid = 1;
+        if (mid >= n) mid = static_cast<std::uint16_t>(n - 1);
+        {
+            const std::size_t target = total / 2;
+            std::size_t acc = 0;
+            for (std::uint16_t i = 0; i < n; ++i)
+            {
+                acc += src.keySuffix(i).size() + sizeof(Value);
+                if (acc >= target)
+                {
+                    mid = (i == 0) ? std::uint16_t{1} : i;
+                    break;
                 }
             }
         }
-        return false;
-    }
+        if (mid == 0) mid = 1;
+        if (mid >= n) mid = static_cast<std::uint16_t>(n - 1);
 
-    std::uint16_t LeafNode::slotCount() const { return page_.slotCount(); }
-    std::string LeafNode::keyAt(std::uint16_t index) const {
-        std::string_view pref = page_.prefixView();
-        std::string_view suff = page_.keySuffix(index);
-        std::string key;
-        key.reserve(pref.size() + suff.size());
-        key.append(pref);
-        key.append(suff);
-        return key;
+        // 2. Compute the truncated separator (paper §2 "Separator Selection").
+        //    separator = LCP(last_left_full, first_right_full) + first differing byte from right.
+        const std::string_view src_prefix = src.prefixView();
+        const std::string_view last_left_suffix = src.keySuffix(static_cast<std::uint16_t>(mid - 1));
+        const std::string_view first_right_suffix = src.keySuffix(mid);
+        const std::size_t suf_common = longest_common_prefix(last_left_suffix, first_right_suffix);
+
+        std::string separator;
+        const std::size_t sep_take = std::min(first_right_suffix.size(), suf_common + 1);
+        separator.reserve(src_prefix.size() + sep_take);
+        separator.append(src_prefix);
+        separator.append(first_right_suffix.data(), sep_take);
+
+        // 3. Snapshot fences before we tear down the source page.
+        //    Lower/upper fence views point into src.bytes_; we copy them into a
+        //    thread-local buffer because the rebuild below overwrites src.
+        thread_local std::string lower_buf;
+        thread_local std::string upper_buf;
+        lower_buf.assign(src.lowerFenceView());
+        upper_buf.assign(src.upperFenceView());
+        const bool had_lower = src.hasLowerFence();
+        const bool had_upper = src.hasUpperFence();
+        const NodeId src_next = src.link();
+        const std::string_view src_lower = had_lower ? std::string_view(lower_buf) : std::string_view{};
+        const std::string_view src_upper = had_upper ? std::string_view(upper_buf) : std::string_view{};
+
+        // 4. Build the right node into the thread-local scratch page, then memcpy.
+        //    Right's fences are (separator, src_upper). Its prefix is LCP(separator, src_upper)
+        //    which is guaranteed >= old prefix (separator and src_upper both share old prefix
+        //    with src_lower, so they share at least old_prefix bytes with each other).
+        tls_scratch.init(NodeType::kLeaf, separator, src_upper);
+        const std::size_t right_prefix_len = tls_scratch.prefixView().size();
+        const std::size_t eat_right = right_prefix_len - src_prefix.size();
+        for (std::uint16_t i = mid; i < n; ++i)
+        {
+            const std::string_view old_suf = src.keySuffix(i);
+            const Value v = src.leafValue(i);
+            const std::string_view new_suf =
+                old_suf.size() > eat_right
+                    ? old_suf.substr(eat_right)
+                    : std::string_view{};
+            tls_scratch.appendLeaf(new_suf, v, make_head(new_suf));
+        }
+        tls_scratch.setLink(src_next);
+        tls_scratch.rebuildHints();
+        std::memcpy(right_node.page_.rawBytes(), tls_scratch.rawBytes(), kPageSizeBytes);
+
+        // 5. Rebuild the left node into scratch, then copy over src.
+        //    We must read left-half slot data from src BEFORE overwriting, which
+        //    is what we do here (the loop reads src; the memcpy at the end writes src).
+        tls_scratch.init(NodeType::kLeaf, src_lower, separator);
+        const std::size_t left_prefix_len = tls_scratch.prefixView().size();
+        const std::size_t eat_left = left_prefix_len - src_prefix.size();
+        for (std::uint16_t i = 0; i < mid; ++i)
+        {
+            const std::string_view old_suf = src.keySuffix(i);
+            const Value v = src.leafValue(i);
+            const std::string_view new_suf =
+                old_suf.size() > eat_left
+                    ? old_suf.substr(eat_left)
+                    : std::string_view{};
+            tls_scratch.appendLeaf(new_suf, v, make_head(new_suf));
+        }
+        tls_scratch.setLink(right_id);
+        tls_scratch.rebuildHints();
+        std::memcpy(src.rawBytes(), tls_scratch.rawBytes(), kPageSizeBytes);
+
+        return separator;
     }
-    Value LeafNode::valueAt(std::uint16_t index) const { return page_.leafValue(index); }
 
 } // namespace abt

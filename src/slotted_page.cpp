@@ -2,203 +2,401 @@
 
 #include <algorithm>
 #include <cstring>
-#include <limits>
 
 namespace abt
 {
 
-    SlottedPage::SlottedPage(NodeType type)
+    namespace
     {
-        clear();
-        header().node_type = static_cast<std::uint8_t>(type);
+        constexpr std::size_t kSlotBaseOffset =
+            sizeof(SlottedPage::Header) + kHintCount * sizeof(std::uint32_t);
     }
 
-    void SlottedPage::clear()
+    void SlottedPage::init(NodeType type, std::string_view lower_fence, std::string_view upper_fence)
     {
-        // FATAL BOTTLENECK REMOVED: Do not zero the 4KB array. 
-        // The slot/payload boundaries safely protect uninitialized memory.
         Header h{};
+        h.node_type = static_cast<std::uint8_t>(type);
         h.slot_count = 0;
-        h.free_begin = static_cast<std::uint16_t>(sizeof(Header));
+        h.free_begin = static_cast<std::uint16_t>(kSlotBaseOffset);
         h.free_end = static_cast<std::uint16_t>(kPageSizeBytes);
         h.prefix_len = 0;
-        h.layout_version = 1;
-        std::memcpy(bytes_.data(), &h, sizeof(Header));
+        h.lower_fence_off = 0;
+        h.lower_fence_len = 0;
+        h.upper_fence_off = 0;
+        h.upper_fence_len = 0;
+        h.link = 0;
+
+        // Place upper fence first (highest address), then lower fence, then payloads grow toward slots.
+        if (!upper_fence.empty() || /* explicit empty fence flag */ false)
+        {
+            h.free_end = static_cast<std::uint16_t>(h.free_end - upper_fence.size());
+            h.upper_fence_off = h.free_end;
+            h.upper_fence_len = static_cast<std::uint16_t>(upper_fence.size());
+            std::memcpy(bytes_ + h.upper_fence_off, upper_fence.data(), upper_fence.size());
+        }
+        if (!lower_fence.empty())
+        {
+            h.free_end = static_cast<std::uint16_t>(h.free_end - lower_fence.size());
+            h.lower_fence_off = h.free_end;
+            h.lower_fence_len = static_cast<std::uint16_t>(lower_fence.size());
+            std::memcpy(bytes_ + h.lower_fence_off, lower_fence.data(), lower_fence.size());
+        }
+
+        // Static prefix truncation: prefix is the LCP of the (untruncated) fences.
+        // If either fence is unbounded (empty/missing), prefix is empty.
+        if (h.lower_fence_len > 0 && h.upper_fence_len > 0)
+        {
+            h.prefix_len = static_cast<std::uint16_t>(longest_common_prefix(lower_fence, upper_fence));
+        }
+
+        std::memcpy(bytes_, &h, sizeof(Header));
+
+        // Zero the hint array up-front (cheap; 64 bytes).
+        std::memset(bytes_ + sizeof(Header), 0, kHintCount * sizeof(std::uint32_t));
     }
 
-    NodeType SlottedPage::type() const { return static_cast<NodeType>(header().node_type); }
-    std::uint16_t SlottedPage::slotCount() const { return header().slot_count; }
-    std::size_t SlottedPage::freeSpace() const { return static_cast<std::size_t>(header().free_end - header().free_begin); }
-
-    std::string SlottedPage::prefix() const
+    std::string_view SlottedPage::prefixView() const
     {
-        const Header &h = header();
-        const char *begin = reinterpret_cast<const char *>(bytes_.data() + sizeof(Header));
-        return std::string(begin, begin + h.prefix_len);
+        const Header& h = header();
+        if (h.prefix_len == 0) return {};
+        // The prefix is the first prefix_len bytes of either fence; lower exists when prefix > 0.
+        const char* base = reinterpret_cast<const char*>(bytes_ + h.lower_fence_off);
+        return std::string_view(base, h.prefix_len);
     }
 
-    std::string_view SlottedPage::prefixView() const {
-        const Header &h = header();
-        const char *begin = reinterpret_cast<const char *>(bytes_.data() + sizeof(Header));
-        return std::string_view(begin, h.prefix_len);
-    }
-
-    void SlottedPage::setPrefix(std::string_view prefix_value)
+    std::string_view SlottedPage::lowerFenceView() const
     {
-        if (header().slot_count != 0) throw std::logic_error("setPrefix requires an empty page");
-        if (sizeof(Header) + prefix_value.size() > kPageSizeBytes) throw std::invalid_argument("prefix does not fit in page");
-
-        Header &h = header();
-        h.prefix_len = static_cast<std::uint16_t>(prefix_value.size());
-        std::memcpy(bytes_.data() + sizeof(Header), prefix_value.data(), prefix_value.size());
-        h.free_begin = static_cast<std::uint16_t>(sizeof(Header) + prefix_value.size());
-        h.free_end = static_cast<std::uint16_t>(kPageSizeBytes);
+        const Header& h = header();
+        if (h.lower_fence_off == 0) return {};
+        const char* base = reinterpret_cast<const char*>(bytes_ + h.lower_fence_off);
+        return std::string_view(base, h.lower_fence_len);
     }
 
-    bool SlottedPage::hasSpaceForLeaf(std::size_t key_len, std::size_t value_len) const
+    std::string_view SlottedPage::upperFenceView() const
     {
-        return (sizeof(LeafSlot) + key_len + value_len) <= freeSpace();
+        const Header& h = header();
+        if (h.upper_fence_off == 0) return {};
+        const char* base = reinterpret_cast<const char*>(bytes_ + h.upper_fence_off);
+        return std::string_view(base, h.upper_fence_len);
     }
 
-    bool SlottedPage::hasSpaceForInner(std::size_t key_len) const
+    bool SlottedPage::insertLeaf(std::uint16_t pos, std::string_view suffix, Value value, std::uint32_t head)
     {
-        return (sizeof(InnerSlot) + key_len) <= freeSpace();
-    }
-
-    bool SlottedPage::insertLeaf(std::uint16_t pos, std::string_view key_suffix, Value value, std::uint16_t hint) {
-        return insertLeaf(pos, key_suffix, "", value, hint);
-    }
-
-    bool SlottedPage::insertInner(std::uint16_t pos, std::string_view key_suffix, NodeId right_child, std::uint16_t hint) {
-        return insertInner(pos, key_suffix, "", right_child, hint);
-    }
-
-    bool SlottedPage::insertLeaf(std::uint16_t pos, std::string_view p1, std::string_view p2, Value value, std::uint16_t hint)
-    {
-        if (type() != NodeType::kLeaf) return false;
-        Header &h = header();
+        Header& h = header();
         if (pos > h.slot_count) return false;
+        if (!hasSpaceForLeaf(suffix.size())) return false;
 
-        const std::size_t key_len = p1.size() + p2.size();
-        constexpr std::size_t value_len = sizeof(Value);
-        if (!hasSpaceForLeaf(key_len, value_len)) return false;
-
-        const std::size_t payload_size = key_len + value_len;
+        const std::size_t payload_size = suffix.size() + sizeof(Value);
         const std::uint16_t payload_offset = static_cast<std::uint16_t>(h.free_end - payload_size);
 
-        std::uint8_t *payload = payloadAt(payload_offset);
-        if (!p1.empty()) std::memcpy(payload, p1.data(), p1.size());
-        if (!p2.empty()) std::memcpy(payload + p1.size(), p2.data(), p2.size());
-        std::memcpy(payload + key_len, &value, sizeof(Value));
+        std::uint8_t* p = bytes_ + payload_offset;
+        if (!suffix.empty())
+            std::memcpy(p, suffix.data(), suffix.size());
+        std::memcpy(p + suffix.size(), &value, sizeof(Value));
 
-        shiftSlotsRight(pos);
-        LeafSlot slot{};
-        slot.key_len = static_cast<std::uint16_t>(key_len);
-        slot.payload_offset = payload_offset;
-        slot.hint = hint;
-        slot.value_len = static_cast<std::uint16_t>(value_len);
-        setLeafSlotAt(pos, slot);
+        LeafSlot* slots = leafSlots();
+        if (pos < h.slot_count)
+        {
+            std::memmove(slots + pos + 1, slots + pos,
+                         (h.slot_count - pos) * sizeof(LeafSlot));
+        }
+        slots[pos].head = head;
+        slots[pos].offset = payload_offset;
+        slots[pos].key_len = static_cast<std::uint16_t>(suffix.size());
 
-        h.slot_count++;
-        h.free_begin += sizeof(LeafSlot);
+        ++h.slot_count;
+        h.free_begin = static_cast<std::uint16_t>(h.free_begin + sizeof(LeafSlot));
         h.free_end = payload_offset;
         return true;
     }
 
-    bool SlottedPage::insertInner(std::uint16_t pos, std::string_view p1, std::string_view p2, NodeId right_child, std::uint16_t hint)
+    bool SlottedPage::insertInner(std::uint16_t pos, std::string_view suffix, NodeId right_child, std::uint32_t head)
     {
-        if (type() != NodeType::kInner) return false;
-        Header &h = header();
+        Header& h = header();
         if (pos > h.slot_count) return false;
+        if (!hasSpaceForInner(suffix.size())) return false;
 
-        const std::size_t key_len = p1.size() + p2.size();
-        if (!hasSpaceForInner(key_len)) return false;
-
-        const std::size_t payload_size = key_len;
+        const std::size_t payload_size = suffix.size();
         const std::uint16_t payload_offset = static_cast<std::uint16_t>(h.free_end - payload_size);
 
-        std::uint8_t *payload = payloadAt(payload_offset);
-        if (!p1.empty()) std::memcpy(payload, p1.data(), p1.size());
-        if (!p2.empty()) std::memcpy(payload + p1.size(), p2.data(), p2.size());
+        if (!suffix.empty())
+            std::memcpy(bytes_ + payload_offset, suffix.data(), suffix.size());
 
-        shiftSlotsRight(pos);
-        InnerSlot slot{};
-        slot.key_len = static_cast<std::uint16_t>(key_len);
-        slot.payload_offset = payload_offset;
-        slot.hint = hint;
-        slot.right_child = right_child;
-        setInnerSlotAt(pos, slot);
+        InnerSlot* slots = innerSlots();
+        if (pos < h.slot_count)
+        {
+            std::memmove(slots + pos + 1, slots + pos,
+                         (h.slot_count - pos) * sizeof(InnerSlot));
+        }
+        slots[pos].head = head;
+        slots[pos].offset = payload_offset;
+        slots[pos].key_len = static_cast<std::uint16_t>(suffix.size());
+        slots[pos].right_child = right_child;
 
-        h.slot_count++;
-        h.free_begin += sizeof(InnerSlot);
+        ++h.slot_count;
+        h.free_begin = static_cast<std::uint16_t>(h.free_begin + sizeof(InnerSlot));
         h.free_end = payload_offset;
         return true;
+    }
+
+    void SlottedPage::appendLeaf(std::string_view suffix, Value value, std::uint32_t head)
+    {
+        Header& h = header();
+        const std::size_t payload_size = suffix.size() + sizeof(Value);
+        const std::uint16_t payload_offset = static_cast<std::uint16_t>(h.free_end - payload_size);
+
+        std::uint8_t* p = bytes_ + payload_offset;
+        if (!suffix.empty())
+            std::memcpy(p, suffix.data(), suffix.size());
+        std::memcpy(p + suffix.size(), &value, sizeof(Value));
+
+        LeafSlot* slots = leafSlots();
+        slots[h.slot_count].head = head;
+        slots[h.slot_count].offset = payload_offset;
+        slots[h.slot_count].key_len = static_cast<std::uint16_t>(suffix.size());
+
+        ++h.slot_count;
+        h.free_begin = static_cast<std::uint16_t>(h.free_begin + sizeof(LeafSlot));
+        h.free_end = payload_offset;
+    }
+
+    void SlottedPage::appendInner(std::string_view suffix, NodeId right_child, std::uint32_t head)
+    {
+        Header& h = header();
+        const std::size_t payload_size = suffix.size();
+        const std::uint16_t payload_offset = static_cast<std::uint16_t>(h.free_end - payload_size);
+
+        if (!suffix.empty())
+            std::memcpy(bytes_ + payload_offset, suffix.data(), suffix.size());
+
+        InnerSlot* slots = innerSlots();
+        slots[h.slot_count].head = head;
+        slots[h.slot_count].offset = payload_offset;
+        slots[h.slot_count].key_len = static_cast<std::uint16_t>(suffix.size());
+        slots[h.slot_count].right_child = right_child;
+
+        ++h.slot_count;
+        h.free_begin = static_cast<std::uint16_t>(h.free_begin + sizeof(InnerSlot));
+        h.free_end = payload_offset;
     }
 
     std::string_view SlottedPage::keySuffix(std::uint16_t index) const
     {
         if (type() == NodeType::kLeaf)
         {
-            const LeafSlot slot = leafSlotAt(index);
-            const char *ptr = reinterpret_cast<const char *>(payloadAt(slot.payload_offset));
-            return std::string_view(ptr, slot.key_len);
+            const LeafSlot& s = leafSlots()[index];
+            return std::string_view(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
         }
-
-        const InnerSlot slot = innerSlotAt(index);
-        const char *ptr = reinterpret_cast<const char *>(payloadAt(slot.payload_offset));
-        return std::string_view(ptr, slot.key_len);
+        const InnerSlot& s = innerSlots()[index];
+        return std::string_view(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
     }
 
-    std::uint16_t SlottedPage::hintAt(std::uint16_t index) const
+    std::uint32_t SlottedPage::headAt(std::uint16_t index) const
     {
-        return type() == NodeType::kLeaf ? leafSlotAt(index).hint : innerSlotAt(index).hint;
+        return type() == NodeType::kLeaf ? leafSlots()[index].head : innerSlots()[index].head;
     }
 
     Value SlottedPage::leafValue(std::uint16_t index) const
     {
-        const LeafSlot slot = leafSlotAt(index);
-        Value value = 0;
-        const std::uint8_t *ptr = payloadAt(slot.payload_offset) + slot.key_len;
-        std::memcpy(&value, ptr, sizeof(Value));
-        return value;
+        const LeafSlot& s = leafSlots()[index];
+        Value v = 0;
+        std::memcpy(&v, bytes_ + s.offset + s.key_len, sizeof(Value));
+        return v;
     }
 
     void SlottedPage::setLeafValue(std::uint16_t index, Value value)
     {
-        LeafSlot slot = leafSlotAt(index);
-        if (slot.value_len != sizeof(Value)) throw std::logic_error("value size mismatch");
-        std::uint8_t *ptr = payloadAt(slot.payload_offset) + slot.key_len;
-        std::memcpy(ptr, &value, sizeof(Value));
+        const LeafSlot& s = leafSlots()[index];
+        std::memcpy(bytes_ + s.offset + s.key_len, &value, sizeof(Value));
     }
 
-    NodeId SlottedPage::rightChild(std::uint16_t index) const { return innerSlotAt(index).right_child; }
-    NodeId SlottedPage::leftChild() const { return header().left_child; }
-    void SlottedPage::setLeftChild(NodeId id) { header().left_child = id; }
-    NodeId SlottedPage::nextLeaf() const { return header().next_leaf; }
-    void SlottedPage::setNextLeaf(NodeId id) { header().next_leaf = id; }
-
-    SlottedPage::Header &SlottedPage::header() { return *reinterpret_cast<Header *>(bytes_.data()); }
-    const SlottedPage::Header &SlottedPage::header() const { return *reinterpret_cast<const Header *>(bytes_.data()); }
-    std::uint8_t *SlottedPage::slotBase() { return bytes_.data() + sizeof(Header) + header().prefix_len; }
-    const std::uint8_t *SlottedPage::slotBase() const { return bytes_.data() + sizeof(Header) + header().prefix_len; }
-    std::uint8_t *SlottedPage::payloadAt(std::uint16_t offset) { return bytes_.data() + offset; }
-    const std::uint8_t *SlottedPage::payloadAt(std::uint16_t offset) const { return bytes_.data() + offset; }
-
-    std::size_t SlottedPage::slotSize() const { return type() == NodeType::kLeaf ? sizeof(LeafSlot) : sizeof(InnerSlot); }
-    SlottedPage::LeafSlot SlottedPage::leafSlotAt(std::uint16_t index) const { return readSlot<LeafSlot>(index); }
-    void SlottedPage::setLeafSlotAt(std::uint16_t index, const LeafSlot &slot) { writeSlot<LeafSlot>(index, slot); }
-    SlottedPage::InnerSlot SlottedPage::innerSlotAt(std::uint16_t index) const { return readSlot<InnerSlot>(index); }
-    void SlottedPage::setInnerSlotAt(std::uint16_t index, const InnerSlot &slot) { writeSlot<InnerSlot>(index, slot); }
-
-    void SlottedPage::shiftSlotsRight(std::uint16_t pos)
+    NodeId SlottedPage::rightChild(std::uint16_t index) const
     {
-        Header &h = header();
-        const std::size_t move_count = static_cast<std::size_t>(h.slot_count - pos);
-        if (move_count == 0) return;
-        const std::size_t stride = slotSize();
-        std::uint8_t *base = slotBase();
-        const std::size_t src = static_cast<std::size_t>(pos) * stride;
-        std::memmove(base + src + stride, base + src, move_count * stride);
+        return innerSlots()[index].right_child;
+    }
+
+    std::uint32_t SlottedPage::hintAt(std::uint16_t i) const
+    {
+        return hintArray()[i];
+    }
+
+    void SlottedPage::rebuildHints()
+    {
+        const Header& h = header();
+        std::uint32_t* hints = hintArray();
+        if (h.slot_count == 0)
+        {
+            std::memset(hints, 0, kHintCount * sizeof(std::uint32_t));
+            return;
+        }
+        // Hint at i samples slot at (slot_count / (kHintCount + 1)) * (i + 1).
+        // When slot_count <= kHintCount, the hints degenerate but binary search
+        // is still correct; we sample by clamping to slot_count - 1.
+        const std::uint32_t spacing = h.slot_count / (kHintCount + 1);
+        if (spacing == 0)
+        {
+            // Too few slots to sample meaningfully. Fill with the last head so
+            // the hint-search just falls through to the full-range binary search.
+            const std::uint32_t last_head = headAt(static_cast<std::uint16_t>(h.slot_count - 1));
+            for (std::uint16_t i = 0; i < kHintCount; ++i) hints[i] = last_head;
+            return;
+        }
+        for (std::uint16_t i = 0; i < kHintCount; ++i)
+        {
+            const std::uint16_t idx = static_cast<std::uint16_t>(spacing * (i + 1));
+            hints[i] = headAt(idx);
+        }
+    }
+
+    std::uint16_t SlottedPage::lowerBoundIndex(std::uint32_t target_head, std::string_view target_suffix) const
+    {
+        const Header& h = header();
+        if (h.slot_count == 0) return 0;
+
+        // Narrow the search range using hints. lo and hi must be SAFE bounds —
+        // tighter on lo using the last hint strictly less than target, and tighter
+        // on hi using the FIRST hint strictly greater than target (advancing past
+        // any equal hints, since hints with equal heads cannot rule the slot out).
+        std::uint16_t lo = 0;
+        std::uint16_t hi = h.slot_count;
+        const std::uint32_t spacing = h.slot_count / (kHintCount + 1);
+        if (spacing >= 1)
+        {
+            const std::uint32_t* hints = hintArray();
+            std::uint16_t i = 0;
+            while (i < kHintCount && hints[i] < target_head) ++i;
+            if (i > 0)
+                lo = static_cast<std::uint16_t>(spacing * i + 1);
+            std::uint16_t j = i;
+            while (j < kHintCount && hints[j] <= target_head) ++j;
+            if (j < kHintCount)
+                hi = static_cast<std::uint16_t>(spacing * (j + 1) + 1);
+            if (hi > h.slot_count) hi = h.slot_count;
+            if (lo > hi) lo = hi;
+        }
+
+        // Standard lower_bound on (head, suffix).
+        if (type() == NodeType::kLeaf)
+        {
+            const LeafSlot* slots = leafSlots();
+            while (lo < hi)
+            {
+                const std::uint16_t mid = lo + ((hi - lo) >> 1);
+                const LeafSlot& s = slots[mid];
+                if (s.head < target_head)
+                {
+                    lo = mid + 1;
+                }
+                else if (s.head > target_head)
+                {
+                    hi = mid;
+                }
+                else
+                {
+                    std::string_view suf(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
+                    if (suf < target_suffix) lo = mid + 1;
+                    else hi = mid;
+                }
+            }
+        }
+        else
+        {
+            const InnerSlot* slots = innerSlots();
+            while (lo < hi)
+            {
+                const std::uint16_t mid = lo + ((hi - lo) >> 1);
+                const InnerSlot& s = slots[mid];
+                if (s.head < target_head)
+                {
+                    lo = mid + 1;
+                }
+                else if (s.head > target_head)
+                {
+                    hi = mid;
+                }
+                else
+                {
+                    std::string_view suf(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
+                    if (suf < target_suffix) lo = mid + 1;
+                    else hi = mid;
+                }
+            }
+        }
+        return lo;
+    }
+
+    std::uint16_t SlottedPage::upperBoundIndex(std::uint32_t target_head, std::string_view target_suffix) const
+    {
+        const Header& h = header();
+        if (h.slot_count == 0) return 0;
+
+        // Same hint narrowing as lowerBoundIndex; the binary-search comparison
+        // below uses <= to implement strict upper_bound.
+        std::uint16_t lo = 0;
+        std::uint16_t hi = h.slot_count;
+        const std::uint32_t spacing = h.slot_count / (kHintCount + 1);
+        if (spacing >= 1)
+        {
+            const std::uint32_t* hints = hintArray();
+            std::uint16_t i = 0;
+            while (i < kHintCount && hints[i] < target_head) ++i;
+            if (i > 0)
+                lo = static_cast<std::uint16_t>(spacing * i + 1);
+            std::uint16_t j = i;
+            while (j < kHintCount && hints[j] <= target_head) ++j;
+            if (j < kHintCount)
+                hi = static_cast<std::uint16_t>(spacing * (j + 1) + 1);
+            if (hi > h.slot_count) hi = h.slot_count;
+            if (lo > hi) lo = hi;
+        }
+
+        if (type() == NodeType::kLeaf)
+        {
+            const LeafSlot* slots = leafSlots();
+            while (lo < hi)
+            {
+                const std::uint16_t mid = lo + ((hi - lo) >> 1);
+                const LeafSlot& s = slots[mid];
+                if (s.head < target_head)
+                {
+                    lo = mid + 1;
+                }
+                else if (s.head > target_head)
+                {
+                    hi = mid;
+                }
+                else
+                {
+                    std::string_view suf(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
+                    if (suf <= target_suffix) lo = mid + 1;
+                    else hi = mid;
+                }
+            }
+        }
+        else
+        {
+            const InnerSlot* slots = innerSlots();
+            while (lo < hi)
+            {
+                const std::uint16_t mid = lo + ((hi - lo) >> 1);
+                const InnerSlot& s = slots[mid];
+                if (s.head < target_head)
+                {
+                    lo = mid + 1;
+                }
+                else if (s.head > target_head)
+                {
+                    hi = mid;
+                }
+                else
+                {
+                    std::string_view suf(reinterpret_cast<const char*>(bytes_ + s.offset), s.key_len);
+                    if (suf <= target_suffix) lo = mid + 1;
+                    else hi = mid;
+                }
+            }
+        }
+        return lo;
     }
 
 } // namespace abt

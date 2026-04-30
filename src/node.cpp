@@ -2,32 +2,6 @@
 
 namespace abt
 {
-
-    Node::Node(NodeId id, NodeType type) : id_(id), page_(type) {}
-
-    NodeId Node::id() const
-    {
-        return id_;
-    }
-
-    NodeType Node::type() const
-    {
-        return page_.type();
-    }
-
-    bool Node::isLeaf() const
-    {
-        return type() == NodeType::kLeaf;
-    }
-
-    const SlottedPage &Node::page() const
-    {
-        return page_;
-    }
-
-    SlottedPage &Node::page()
-    {
-        return page_;
-    }
-
+    // Node is fully defined inline in node.hpp; this translation unit exists
+    // only so the build system has something to compile.
 } // namespace abt

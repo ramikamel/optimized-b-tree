@@ -3,52 +3,42 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "adaptive_btree/node.hpp"
 
 namespace abt
 {
 
-    struct LeafEntry
-    {
-        std::string key;
-        Value value;
-    };
-
-    struct LeafEntryView {
-        std::string_view key; // Suffix if from page, full key if new
-        Value value;
-        bool is_new;
-    };
-
     class LeafNode final : public Node
     {
     public:
-        explicit LeafNode(NodeId id);
+        explicit LeafNode(NodeId id) : Node(id, NodeType::kLeaf) {}
 
-        std::vector<LeafEntry> entries() const;
-        bool rebuild(const std::vector<LeafEntry> &sorted_entries);
+        // Reset to empty with the given fences and forward link.
+        void initEmpty(std::string_view lower_fence, std::string_view upper_fence, NodeId next_leaf);
 
-        std::vector<LeafEntryView> entryViews() const;
-        bool rebuildFromViews(const std::vector<LeafEntryView> &sorted_entries, std::string_view new_key);
+        // Try to insert (key, value) without splitting. Returns false only if
+        // the page is out of space. Sets *inserted_new = false on upsert.
+        bool tryInsert(std::string_view key, Value value, bool& inserted_new);
 
         std::optional<Value> find(std::string_view key) const;
-        std::size_t lowerBoundIndex(std::string_view key) const;
 
-        NodeId nextLeaf() const;
-        void setNextLeaf(NodeId id);
+        // Lower-bound on full key, used for range scans.
+        std::uint16_t lowerBoundIndex(std::string_view key) const;
 
-        bool tryInsertInPlace(std::string_view key, Value value, bool& inserted_new);
-        std::uint16_t slotCount() const;
-        std::string keyAt(std::uint16_t index) const;
-        Value valueAt(std::uint16_t index) const;
-        std::string_view prefixView() const;
+        NodeId nextLeaf() const { return page_.link(); }
+        void setNextLeaf(NodeId id) { page_.setLink(id); }
 
-    private:
-        int compareKeyAt(std::uint16_t slot_index, std::string_view key) const;
-        static std::string commonPrefix(const std::vector<LeafEntry> &sorted_entries);
-        static std::string commonPrefixFromViews(const std::vector<LeafEntryView> &sorted_entries, std::string_view new_key, std::string_view old_prefix);
+        std::uint16_t slotCount() const { return page_.slotCount(); }
+        std::string_view keySuffix(std::uint16_t i) const { return page_.keySuffix(i); }
+        std::string_view prefixView() const { return page_.prefixView(); }
+        Value valueAt(std::uint16_t i) const { return page_.leafValue(i); }
+        std::string keyAt(std::uint16_t i) const;
+
+        // Split this leaf in half. The right-half entries are written to
+        // `right_node` (which must be freshly allocated). Returns the truncated
+        // separator that should be promoted to the parent.
+        std::string splitInto(LeafNode& right_node, NodeId right_id);
     };
 
 } // namespace abt

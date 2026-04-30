@@ -1,15 +1,18 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "adaptive_btree/adaptive_btree.hpp"
-#include "baseline_bplus_tree/baseline_bplus_tree.hpp" // NEW BASELINE
+#include "baseline_bplus_tree/baseline_bplus_tree.hpp"
 
 namespace {
 
@@ -98,6 +101,14 @@ std::vector<std::string> generateIntegerStrings(std::size_t count) {
     return keys;
 }
 
+// Volatile sink prevents the optimizer (especially under LTO) from deleting
+// the work in benchmark loops whose results are otherwise unobserved.
+volatile std::uint64_t g_sink = 0;
+
+inline void doNotOptimize(std::uint64_t v) {
+    g_sink ^= v;
+}
+
 template <typename Func>
 double measureThroughput(const std::string& label, std::size_t operations, Func&& fn) {
     const auto start = Clock::now();
@@ -117,13 +128,12 @@ void runDatasetBenchmark(const std::string& dataset_name, const std::vector<std:
     std::vector<std::size_t> probe_indices(keys.size());
     std::iota(probe_indices.begin(), probe_indices.end(), 0);
     std::shuffle(probe_indices.begin(), probe_indices.end(), rng);
-    
+
     const std::size_t query_count = std::min<std::size_t>(keys.size(), 50000);
     const std::size_t range_ops = std::min<std::size_t>(query_count, 10000);
     constexpr std::size_t scan_len = 32;
 
-    // --- OPTIMIZED B-TREE ---
-    std::cout << "[Adaptive B-Tree: Slotted Pages + Truncation + Hints]\n";
+    std::cout << "[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]\n";
     abt::AdaptiveBTree tree;
     measureThroughput("insert", keys.size(), [&] {
         for (std::size_t i = 0; i < keys.size(); ++i) tree.insert(keys[i], static_cast<abt::Value>(i));
@@ -132,18 +142,26 @@ void runDatasetBenchmark(const std::string& dataset_name, const std::vector<std:
     measureThroughput("point lookup", query_count, [&] {
         std::size_t found = 0;
         for (std::size_t i = 0; i < query_count; ++i) {
-            found += tree.search(keys[probe_indices[i]]).has_value() ? 1 : 0;
+            const auto v = tree.search(keys[probe_indices[i]]);
+            if (v) doNotOptimize(*v);
+            found += v ? 1 : 0;
+        }
+        if (found != query_count) {
+            std::cerr << "ERROR: only " << found << "/" << query_count << " keys found in AdaptiveBTree\n";
+            std::abort();
         }
     });
 
     measureThroughput("range scan", range_ops, [&] {
         std::size_t total_rows = 0;
         for (std::size_t i = 0; i < range_ops; ++i) {
-            total_rows += tree.rangeScan(keys[probe_indices[i]], scan_len).size();
+            auto rows = tree.rangeScan(keys[probe_indices[i]], scan_len);
+            for (const auto& r : rows) doNotOptimize(r.value);
+            total_rows += rows.size();
         }
+        doNotOptimize(static_cast<std::uint64_t>(total_rows));
     });
 
-    // --- BASELINE (Standard B+-Tree) ---
     std::cout << "[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]\n";
     bpt::StandardBPlusTree baseline_tree;
     measureThroughput("insert", keys.size(), [&] {
@@ -153,24 +171,82 @@ void runDatasetBenchmark(const std::string& dataset_name, const std::vector<std:
     measureThroughput("point lookup", query_count, [&] {
         std::size_t found = 0;
         for (std::size_t i = 0; i < query_count; ++i) {
-            found += baseline_tree.search(keys[probe_indices[i]]).has_value() ? 1 : 0;
+            const auto v = baseline_tree.search(keys[probe_indices[i]]);
+            if (v) doNotOptimize(*v);
+            found += v ? 1 : 0;
+        }
+        if (found != query_count) {
+            std::cerr << "ERROR: only " << found << "/" << query_count << " keys found in baseline\n";
+            std::abort();
         }
     });
 
     measureThroughput("range scan", range_ops, [&] {
         std::size_t total_rows = 0;
         for (std::size_t i = 0; i < range_ops; ++i) {
-            total_rows += baseline_tree.rangeScan(keys[probe_indices[i]], scan_len).size();
+            auto rows = baseline_tree.rangeScan(keys[probe_indices[i]], scan_len);
+            for (const auto& r : rows) doNotOptimize(r.value);
+            total_rows += rows.size();
         }
+        doNotOptimize(static_cast<std::uint64_t>(total_rows));
     });
     std::cout << "--------------------------------------------------------\n";
+}
+
+// Lightweight correctness gate. Inserts N keys and verifies every one is retrievable.
+// Aborts on the first miss so a regression cannot be hidden behind benchmark numbers.
+void runCorrectnessSelfCheck() {
+    constexpr std::size_t kCount = 100000;
+    std::mt19937_64 rng(0xC07C0DEULL);
+
+    auto verify = [](const std::string& label, const std::vector<std::string>& keys) {
+        abt::AdaptiveBTree tree;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            tree.insert(keys[i], static_cast<abt::Value>(i));
+            // Spot-check that the just-inserted key is searchable. This catches
+            // a routing/insert disagreement on the first offending key.
+            const auto v = tree.search(keys[i]);
+            if (!v || *v != static_cast<abt::Value>(i)) {
+                std::cerr << "[POST-INSERT MISS] " << label << " i=" << i
+                          << " key=\"" << keys[i] << "\""
+                          << " got=" << (v ? std::to_string(*v) : "<none>") << "\n";
+                std::abort();
+            }
+        }
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            const auto v = tree.search(keys[i]);
+            if (!v || *v != static_cast<abt::Value>(i)) {
+                std::cerr << "[FINAL MISS] " << label << " key=\"" << keys[i] << "\" idx=" << i << "\n";
+                std::abort();
+            }
+        }
+        std::cout << "[selfcheck] " << label << ": " << keys.size() << " inserts/search OK\n";
+    };
+
+    verify("urls", generateUrls(kCount, rng));
+    verify("wiki", generateWikiTitles(kCount, rng));
+    verify("ints", generateIntegerStrings(kCount));
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        std::vector<std::size_t> sizes = {100000, 500000, 1000000};
+        // Always run a small correctness gate before any benchmarking. If this
+        // fails the process aborts so that no misleading numbers are reported.
+        runCorrectnessSelfCheck();
+
+        std::vector<std::size_t> sizes = {1000000, 5000000, 10000000};
+        // Allow callers to override the row counts (kept for parity with previous CLI).
+        if (argc >= 2) {
+            try {
+                const std::size_t custom = static_cast<std::size_t>(std::stoull(argv[1]));
+                if (custom > 0) sizes = {custom};
+            } catch (...) {
+                // ignore parse error; fall back to defaults
+            }
+        }
+
         std::mt19937_64 rng(42);
 
         for (std::size_t count : sizes) {

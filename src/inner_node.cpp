@@ -1,222 +1,154 @@
 #include "adaptive_btree/inner_node.hpp"
 
-#include <algorithm>
-#include <utility>
-
-#include "adaptive_btree/common.hpp"
+#include <cstring>
 
 namespace abt
 {
 
-    InnerNode::InnerNode(NodeId id) : Node(id, NodeType::kInner) {}
-
-    InnerMaterialized InnerNode::materialize() const
+    namespace
     {
-        InnerMaterialized out;
-        out.left_child = page_.leftChild();
-        out.entries.reserve(page_.slotCount());
-        const std::string prefix = page_.prefix();
-        for (std::uint16_t i = 0; i < page_.slotCount(); ++i)
+        thread_local SlottedPage tls_scratch;
+    }
+
+    void InnerNode::initEmpty(std::string_view lower_fence, std::string_view upper_fence, NodeId left_child)
+    {
+        page_.init(NodeType::kInner, lower_fence, upper_fence);
+        page_.setLink(left_child);
+    }
+
+    void InnerNode::initRoot(NodeId left_child, std::string_view separator_full_key, NodeId right_child)
+    {
+        page_.init(NodeType::kInner, {}, {});
+        page_.setLink(left_child);
+        // Root has no fences, so prefix is empty; the separator stores its full key.
+        page_.appendInner(separator_full_key, right_child, make_head(separator_full_key));
+        page_.rebuildHints();
+    }
+
+    bool InnerNode::tryInsertSeparator(std::string_view separator_full_key, NodeId right_child)
+    {
+        const std::size_t prefix_len = page_.prefixLen();
+        const std::string_view suffix(separator_full_key.data() + prefix_len,
+                                      separator_full_key.size() - prefix_len);
+        const std::uint32_t head = make_head(suffix);
+
+        const std::uint16_t n = page_.slotCount();
+        // Tail-insert fast path: sorted insertion appends new separators in order.
+        if (__builtin_expect(n > 0, 1))
         {
-            std::string key = prefix;
-            key.append(page_.keySuffix(i));
-            out.entries.push_back(InnerEntry{std::move(key), page_.rightChild(i)});
-        }
-        return out;
-    }
-
-    InnerMaterializedView InnerNode::materializeViews() const {
-        InnerMaterializedView out;
-        out.left_child = page_.leftChild();
-        out.entries.reserve(page_.slotCount() + 1);
-        for (std::uint16_t i = 0; i < page_.slotCount(); ++i) {
-            out.entries.push_back({page_.keySuffix(i), page_.rightChild(i), false});
-        }
-        return out;
-    }
-
-    std::string InnerNode::commonPrefixFromViews(const std::vector<InnerEntryView> &sorted_entries, std::string_view new_key, std::string_view old_prefix) {
-        if (sorted_entries.empty()) return "";
-        
-        const auto& first_e = sorted_entries.front();
-        const auto& last_e = sorted_entries.back();
-        
-        std::string prefix;
-        std::size_t i = 0;
-        while (true) {
-            char c1, c2;
-            if (first_e.is_new) {
-                if (i >= new_key.size()) break;
-                c1 = new_key[i];
-            } else {
-                if (i < old_prefix.size()) c1 = old_prefix[i];
-                else if (i - old_prefix.size() < first_e.key.size()) c1 = first_e.key[i - old_prefix.size()];
-                else break;
+            const std::uint16_t last_idx = static_cast<std::uint16_t>(n - 1);
+            const std::uint32_t last_head = page_.headAt(last_idx);
+            if (__builtin_expect(head > last_head ||
+                    (head == last_head && suffix > page_.keySuffix(last_idx)), 1))
+            {
+                if (!page_.hasSpaceForInner(suffix.size())) return false;
+                page_.appendInner(suffix, right_child, head);
+                if ((n / (kHintCount + 1)) != ((n + 1) / (kHintCount + 1))) page_.rebuildHints();
+                return true;
             }
-            
-            if (last_e.is_new) {
-                if (i >= new_key.size()) break;
-                c2 = new_key[i];
-            } else {
-                if (i < old_prefix.size()) c2 = old_prefix[i];
-                else if (i - old_prefix.size() < last_e.key.size()) c2 = last_e.key[i - old_prefix.size()];
-                else break;
-            }
-            
-            if (c1 != c2) break;
-            prefix.push_back(c1);
-            ++i;
-        }
-        return prefix;
-    }
-
-    bool InnerNode::rebuildFromViews(NodeId left_child, const std::vector<InnerEntryView> &sorted_entries, std::string_view new_key) {
-        SlottedPage candidate(NodeType::kInner);
-        std::string_view old_prefix = page_.prefixView();
-        std::string prefix = commonPrefixFromViews(sorted_entries, new_key, old_prefix);
-        candidate.setPrefix(prefix);
-        candidate.setLeftChild(left_child);
-
-        for (std::uint16_t i = 0; i < sorted_entries.size(); ++i) {
-            std::string_view p1, p2;
-            if (sorted_entries[i].is_new) {
-                std::size_t start = std::min(prefix.size(), new_key.size());
-                p1 = std::string_view(new_key).substr(start);
-            } else {
-                if (prefix.size() <= old_prefix.size()) {
-                    std::size_t start = std::min(prefix.size(), old_prefix.size());
-                    p1 = old_prefix.substr(start);
-                    p2 = sorted_entries[i].key;
-                } else {
-                    std::size_t eat = prefix.size() - old_prefix.size();
-                    eat = std::min(eat, sorted_entries[i].key.size());
-                    p1 = sorted_entries[i].key.substr(eat);
-                }
-            }
-            
-            char buf[4] = {0, 0, 0, 0};
-            std::size_t n1 = std::min<std::size_t>(4, p1.size());
-            std::memcpy(buf, p1.data(), n1);
-            std::size_t n2 = std::min<std::size_t>(4 - n1, p2.size());
-            std::memcpy(buf + n1, p2.data(), n2);
-            std::uint16_t hint = make_prefix_hint(std::string_view(buf, n1 + n2));
-
-            if (!candidate.insertInner(i, p1, p2, sorted_entries[i].right_child, hint)) return false;
         }
 
-        page_ = std::move(candidate);
+        const std::uint16_t pos = (n == 0) ? std::uint16_t{0} : page_.lowerBoundIndex(head, suffix);
+        if (!page_.insertInner(pos, suffix, right_child, head)) return false;
+        page_.rebuildHints();
         return true;
     }
 
-    bool InnerNode::rebuild(NodeId left_child, const std::vector<InnerEntry> &sorted_entries)
+    std::uint16_t InnerNode::childIndexForKey(std::string_view key) const
     {
-        SlottedPage candidate(NodeType::kInner);
-        const std::string prefix = commonPrefix(sorted_entries);
-        candidate.setPrefix(prefix);
-        candidate.setLeftChild(left_child);
-
-        for (std::uint16_t i = 0; i < sorted_entries.size(); ++i)
+        // Under correct B-tree routing, every key reaching this node lies between
+        // the node's fences and therefore starts with the node's static prefix.
+        // Strip the prefix bytes off and proceed to head/suffix routing.
+        const std::size_t prefix_len = page_.prefixLen();
+        const std::string_view suffix(key.data() + prefix_len, key.size() - prefix_len);
+        const std::uint16_t n = page_.slotCount();
+        if (n == 0) return 0;
+        const std::uint32_t target_head = make_head(suffix);
+        // Sequential-workload fast path: key past the last separator -> rightmost.
+        const std::uint16_t last_idx = static_cast<std::uint16_t>(n - 1);
+        const std::uint32_t last_head = page_.headAt(last_idx);
+        if (target_head > last_head ||
+            (target_head == last_head && suffix >= page_.keySuffix(last_idx)))
         {
-            const std::string_view key = sorted_entries[i].key;
-            const std::string_view suffix = key.substr(prefix.size());
-            const std::uint16_t hint = make_prefix_hint(suffix);
-            if (!candidate.insertInner(i, suffix, sorted_entries[i].right_child, hint)) return false;
+            return n;
         }
-
-        page_ = std::move(candidate);
-        return true;
+        return page_.upperBoundIndex(target_head, suffix);
     }
 
-    std::size_t InnerNode::childIndexForKey(std::string_view key) const {
-        std::size_t lo = 0;
-        std::size_t hi = page_.slotCount();
-
-        const std::string_view prefix = page_.prefixView();
-        
-        bool can_use_hint = false;
-        if (key.size() >= prefix.size() && prefix.size() > 0) {
-            if (std::char_traits<char>::compare(key.data(), prefix.data(), prefix.size()) == 0) {
-                can_use_hint = true;
-            }
-        } else if (prefix.empty()) {
-            can_use_hint = true;
-        }
-
-        std::uint16_t target_hint = 0;
-        if (can_use_hint) {
-            target_hint = make_prefix_hint(key.substr(prefix.size()));
-        }
-
-        while (lo < hi) {
-            const std::size_t mid = lo + ((hi - lo) / 2);
-            int cmp = 0;
-            if (can_use_hint) {
-                const std::uint16_t slot_hint = page_.hintAt(static_cast<std::uint16_t>(mid));
-                if (target_hint < slot_hint) cmp = 1;
-                else if (target_hint > slot_hint) cmp = -1;
-                else cmp = compareKeyAt(static_cast<std::uint16_t>(mid), key);
-            } else {
-                cmp = compareKeyAt(static_cast<std::uint16_t>(mid), key);
-            }
-            if (cmp <= 0) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    NodeId InnerNode::childAt(std::size_t child_index) const {
-        if (child_index == 0) return page_.leftChild();
+    NodeId InnerNode::childAt(std::uint16_t child_index) const
+    {
+        if (child_index == 0) return page_.link();
         return page_.rightChild(static_cast<std::uint16_t>(child_index - 1));
     }
 
-    NodeId InnerNode::childForKey(std::string_view key) const { return childAt(childIndexForKey(key)); }
-    std::string_view InnerNode::prefixView() const { return page_.prefixView(); }
-
-    int InnerNode::compareKeyAt(std::uint16_t slot_index, std::string_view key) const {
-        const std::string_view prefix_view = page_.prefixView();
-        const std::size_t prefix_common = std::min(prefix_view.size(), key.size());
-        
-        if (prefix_common > 0) {
-            const int prefix_cmp = std::char_traits<char>::compare(prefix_view.data(), key.data(), prefix_common);
-            if (prefix_cmp < 0) return -1;
-            if (prefix_cmp > 0) return 1;
-        }
-        if (key.size() < prefix_view.size()) return 1;
-
-        const std::string_view suffix = page_.keySuffix(slot_index);
-        const std::string_view key_suffix = key.substr(prefix_view.size());
-        return lexical_compare(suffix, key_suffix);
-    }
-
-    std::string InnerNode::commonPrefix(const std::vector<InnerEntry> &sorted_entries)
+    std::string InnerNode::splitInto(InnerNode& right_node)
     {
-        if (sorted_entries.empty()) return "";
-        std::string prefix = sorted_entries.front().key;
-        for (std::size_t i = 1; i < sorted_entries.size() && !prefix.empty(); ++i)
-        {
-            const std::string &key = sorted_entries[i].key;
-            std::size_t len = 0;
-            const std::size_t max_len = std::min(prefix.size(), key.size());
-            while (len < max_len && prefix[len] == key[len]) ++len;
-            prefix.resize(len);
-        }
-        return prefix;
-    }
+        SlottedPage& src = page_;
+        const std::uint16_t n = src.slotCount();
+        const std::uint16_t mid = static_cast<std::uint16_t>(n / 2);
 
-    bool InnerNode::tryInsertInPlace(std::string_view key, NodeId right_child) {
-        std::string_view prefix = page_.prefixView();
-        if (key.size() >= prefix.size()) {
-            bool match = true;
-            if (prefix.size() > 0) {
-                match = (std::char_traits<char>::compare(key.data(), prefix.data(), prefix.size()) == 0);
-            }
-            if (match) {
-                std::string_view suffix = key.substr(prefix.size());
-                std::uint16_t hint = make_prefix_hint(suffix);
-                if (page_.insertInner(static_cast<std::uint16_t>(childIndexForKey(key)), suffix, right_child, hint)) return true;
-            }
+        // Snapshot fences/links from src before we tear it down.
+        thread_local std::string lower_buf;
+        thread_local std::string upper_buf;
+        thread_local std::string sep_buf;
+        lower_buf.assign(src.lowerFenceView());
+        upper_buf.assign(src.upperFenceView());
+
+        const std::string_view src_prefix = src.prefixView();
+        const std::string_view mid_suffix = src.keySuffix(mid);
+
+        // Promoted (median) key = prefix + mid_suffix. This key disappears from
+        // both halves and is inserted into the parent.
+        sep_buf.clear();
+        sep_buf.reserve(src_prefix.size() + mid_suffix.size());
+        sep_buf.append(src_prefix);
+        sep_buf.append(mid_suffix);
+
+        const NodeId mid_right_child = src.rightChild(mid);
+        const NodeId orig_left_child = src.link();
+        const bool had_lower = src.hasLowerFence();
+        const bool had_upper = src.hasUpperFence();
+        const std::string_view src_lower = had_lower ? std::string_view(lower_buf) : std::string_view{};
+        const std::string_view src_upper = had_upper ? std::string_view(upper_buf) : std::string_view{};
+        const std::string_view sep_view = sep_buf;
+
+        // Build right node into scratch: fences (sep, src_upper), leftChild = mid_right_child.
+        tls_scratch.init(NodeType::kInner, sep_view, src_upper);
+        tls_scratch.setLink(mid_right_child);
+        const std::size_t right_prefix_len = tls_scratch.prefixView().size();
+        const std::size_t eat_right = right_prefix_len - src_prefix.size();
+        for (std::uint16_t i = static_cast<std::uint16_t>(mid + 1); i < n; ++i)
+        {
+            const std::string_view old_suf = src.keySuffix(i);
+            const NodeId rc = src.rightChild(i);
+            const std::string_view new_suf =
+                old_suf.size() > eat_right
+                    ? old_suf.substr(eat_right)
+                    : std::string_view{};
+            tls_scratch.appendInner(new_suf, rc, make_head(new_suf));
         }
-        return false;
+        tls_scratch.rebuildHints();
+        std::memcpy(right_node.page_.rawBytes(), tls_scratch.rawBytes(), kPageSizeBytes);
+
+        // Build left node into scratch: fences (src_lower, sep), keep original leftChild.
+        tls_scratch.init(NodeType::kInner, src_lower, sep_view);
+        tls_scratch.setLink(orig_left_child);
+        const std::size_t left_prefix_len = tls_scratch.prefixView().size();
+        const std::size_t eat_left = left_prefix_len - src_prefix.size();
+        for (std::uint16_t i = 0; i < mid; ++i)
+        {
+            const std::string_view old_suf = src.keySuffix(i);
+            const NodeId rc = src.rightChild(i);
+            const std::string_view new_suf =
+                old_suf.size() > eat_left
+                    ? old_suf.substr(eat_left)
+                    : std::string_view{};
+            tls_scratch.appendInner(new_suf, rc, make_head(new_suf));
+        }
+        tls_scratch.rebuildHints();
+        std::memcpy(src.rawBytes(), tls_scratch.rawBytes(), kPageSizeBytes);
+
+        return sep_buf;
     }
 
 } // namespace abt

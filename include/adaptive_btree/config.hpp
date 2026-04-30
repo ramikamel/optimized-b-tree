@@ -1,17 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace abt
 {
 
     constexpr std::size_t kPageSizeBytes = 4096;
+    constexpr std::uint16_t kHintCount = 16;
 
     struct FeatureFlags
     {
-        // Hook for future semi-dense/fully dense leaf encodings.
         bool enable_dense_leaves = false;
-        // Hook for future hash-based fingerprinting paths.
         bool enable_fingerprinting = false;
     };
 

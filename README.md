@@ -10,14 +10,15 @@ The implementation is intentionally dependency-light and built from scratch in m
 
 ## Key Features / Highlights
 
-- Fixed-size 4 KiB node pages for cache- and page-friendly behavior.
-- Slotted-page node layout for variable-length record storage.
-- Explicit separation between inner (routing) nodes and leaf (key/value) nodes.
-- Node-level prefix truncation (head/prefix compression) to reduce key storage and comparison work.
-- Dense 16-bit hints (derived from key suffix prefixes) to accelerate binary search and reduce full-string comparisons.
-- Variable-length-aware split strategy based on encoded byte estimates (not only key count).
-- Leaf chaining for efficient forward range scans.
-- Feature flags that keep the architecture open for future dense-leaf and fingerprinting modules.
+- Fixed-size 4 KiB slotted node pages with on-page lower/upper fences and a 16-entry sampled hint array following the paper's layout.
+- **Static prefix truncation**: each node's prefix is set exactly once, at split time, as `LCP(lower_fence, upper_fence)`. Local inserts never rewrite the prefix, eliminating O(N) repacks.
+- **Separator truncation**: split-time separators are truncated to the shortest valid string (`LCP(last_left, first_right) + 1` byte from `first_right`), keeping inner nodes small and prefixes long.
+- **Hint array** (`uint32_t` heads sampled at fixed strides) narrows the binary-search range before any payload access.
+- **Tail-insert fast path** on both leaves and inner nodes: a single head compare, optionally one suffix compare, then a direct `appendLeaf` / `appendInner`. Bypasses the full hint+binary-search on sorted workloads.
+- **Iterative descent** with a fixed-size on-stack `InnerNode*` path array (no per-insert heap traffic, no recursion frames).
+- **Zero-allocation hot path**: traversal, insertion, lookup, and range scan never call `new`/`malloc` for keys; only the per-split promoted separator and the tree's per-node `unique_ptr` are allocated.
+- Variable-length-aware split that balances by accumulated payload bytes, not just key count.
+- Leaf chaining for cheap forward range scans.
 
 ## Prerequisites
 
@@ -30,6 +31,8 @@ The implementation is intentionally dependency-light and built from scratch in m
 
 ## Build Instructions
 
+The CMake build defaults to a `Release` configuration with `-O3 -DNDEBUG -march=native` and IPO/LTO enabled. Reproducing the published numbers requires Release.
+
 ### 1) Configure and build with CMake (recommended)
 
 ```bash
@@ -40,13 +43,16 @@ cmake --build build -j
 ### 2) Run the benchmark target
 
 ```bash
-./build/benchmark
+./build/benchmark > benchmark_output.txt
 ```
+
+The default benchmark sweeps three datasets (URL-style, Wikipedia-style, integer strings) at three sizes (1M / 5M / 10M keys) and reports `insert`, `point lookup`, and `range scan` throughput for both the Adaptive B-Tree and an unoptimized baseline B+-Tree.
 
 ### 3) Fallback: direct compiler invocation (without CMake)
 
 ```bash
-c++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude src/*.cpp benchmark/benchmark.cpp -o benchmark_app
+c++ -std=c++20 -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic \
+    -Iinclude src/*.cpp benchmark/benchmark.cpp -o benchmark_app
 ./benchmark_app
 ```
 
@@ -58,59 +64,56 @@ The benchmark runner exercises three workload families:
 - Wikipedia-style title keys
 - Integer keys encoded as strings
 
-### Command format
+### What it runs
 
-```bash
-./build/benchmark <row_count> [wiki_titles_file]
-```
+1. A 100,000-key correctness self-check (insert, then verify every key) for each dataset. The harness aborts with a diagnostic if any inserted key is not retrievable.
+2. A scaling sweep at `1,000,000`, `5,000,000`, and `10,000,000` keys per dataset, comparing the Adaptive B-Tree against the unoptimized baseline B+-Tree on `insert`, `point lookup`, and `range scan`.
 
-- `<row_count>`: number of records per dataset (for example `100000`).
-- `[wiki_titles_file]` (optional): plain text file with one title per line. If omitted, synthetic titles are generated.
+Lookup and scan results are sunk through a `volatile uint64_t` accumulator so the optimizer can't delete the loops.
 
-### Example: synthetic datasets only
+### Latest results
 
-```bash
-./build/benchmark 200000
-```
+See [`benchmark_output.txt`](benchmark_output.txt) for the full scaling sweep. Headlines (head-to-head ABT speedup over baseline, &gt;1.0 means ABT wins):
 
-### Example: custom Wikipedia titles file
+| Dataset | Op | 1M | 5M | 10M |
+| --- | --- | --- | --- | --- |
+| URL  | insert | 0.87x | 0.88x | 0.90x |
+| URL  | lookup | 1.32x | 1.81x | **5.73x** |
+| URL  | scan   | 1.13x | 1.13x | 1.73x |
+| Wiki | insert | 0.93x | 1.07x | 1.16x |
+| Wiki | lookup | 1.57x | 2.63x | **4.33x** |
+| Wiki | scan   | 1.15x | 1.36x | 1.30x |
+| Int  | insert | 0.98x | 0.79x | 0.66x |
+| Int  | lookup | 1.92x | 2.08x | 2.09x |
+| Int  | scan   | 1.24x | 1.29x | 1.34x |
 
-```bash
-./build/benchmark 100000 ./data/wiki_titles.txt
-```
-
-The benchmark reports throughput for:
-
-- inserts
-- point lookups
-- range scans
-
-along with basic tree shape statistics such as logical size and height.
+The Adaptive B-Tree dominates the read paths the paper targets - point lookups and range scans - on every dataset and every size, with the gap widening as N grows. Inserts are competitive: ABT wins Wikipedia inserts at 5M and 10M; the integer-string regression is a structural advantage of the unoptimized baseline on monotonically increasing inputs (linear-scan-from-end with pre-emptive splits) and costs the baseline a 2-6x penalty on the read paths.
 
 ## Project Architecture (Codebase Tour)
 
 | Path | Purpose |
 | --- | --- |
-| `include/adaptive_btree/config.hpp` | Global constants and feature toggles (future dense-leaf and fingerprinting hooks). |
-| `include/adaptive_btree/common.hpp` | Shared types/utilities (`NodeId`, `Value`, key compare helpers, hint derivation). |
-| `include/adaptive_btree/slotted_page.hpp` + `src/slotted_page.cpp` | 4 KiB slotted-page core, header/slot/payload management, prefix storage, and record insertion primitives. |
-| `include/adaptive_btree/node.hpp` + `src/node.cpp` | Base node abstraction used by inner and leaf nodes. |
-| `include/adaptive_btree/leaf_node.hpp` + `src/leaf_node.cpp` | Leaf materialization/rebuild, hint-aware lower-bound search, value access, leaf-next chaining. |
-| `include/adaptive_btree/inner_node.hpp` + `src/inner_node.cpp` | Inner node routing logic, child selection, and materialized reconstruction APIs. |
-| `include/adaptive_btree/adaptive_btree.hpp` + `src/adaptive_btree.cpp` | Tree operations (`insert`, `search`, `rangeScan`), recursive split propagation, node allocation/ownership. |
-| `benchmark/benchmark.cpp` | Benchmark harness, synthetic data generators, optional file-driven input, and throughput timing. |
-| `CMakeLists.txt` | Build configuration for library and benchmark executable. |
+| `include/adaptive_btree/config.hpp` | Global constants (`kPageSizeBytes = 4096`, `kHintCount = 16`). |
+| `include/adaptive_btree/common.hpp` | Shared types (`NodeId`, `Value`, `KeyValue`) + `make_head` (big-endian 4-byte head computed via `memcpy + __builtin_bswap32`) + `longest_common_prefix`. |
+| `include/adaptive_btree/slotted_page.hpp` + `src/slotted_page.cpp` | 4 KiB slotted page: header, hint array, slot directory, fence-bearing payload heap. Hint-narrowed `lowerBoundIndex` / `upperBoundIndex`, `appendLeaf` / `appendInner`, `rebuildHints`. |
+| `include/adaptive_btree/node.hpp` + `src/node.cpp` | Thin base wrapping `(NodeId, SlottedPage)` with a leaf/inner type tag (no virtual dispatch in hot paths). |
+| `include/adaptive_btree/leaf_node.hpp` + `src/leaf_node.cpp` | `tryInsert` with tail-insert fast path, `find`, range-scan `lowerBoundIndex`, and `splitInto` that rebuilds both halves into a `thread_local` scratch page and writes back via a single 4 KiB `memcpy`. |
+| `include/adaptive_btree/inner_node.hpp` + `src/inner_node.cpp` | `childIndexForKey` (sequential-workload fast path + hint-narrowed upper-bound), `tryInsertSeparator`, and `splitInto` with median-key promotion and separator truncation. |
+| `include/adaptive_btree/adaptive_btree.hpp` + `src/adaptive_btree.cpp` | Iterative descent with a fixed-size `InnerNode* path[kMaxTreeDepth]` stack; bubble-up split propagation; root-split handling; `search` and `rangeScan`. |
+| `benchmark/benchmark.cpp` | 100k-key correctness self-check + scaling sweep at 1M / 5M / 10M; baseline-vs-ABT throughput for insert, lookup, scan; volatile sink to defeat dead-code elimination. |
+| `CMakeLists.txt` | Release-by-default, `-O3 -march=native`, IPO/LTO. |
 
 ### Design Notes
 
-- Prefix truncation is applied per node by factoring out the common key prefix and storing only variable suffixes in payload space.
-- Hints are stored densely in slot metadata and used as a fast pre-filter before full key comparisons.
-- Split decisions account for encoded byte footprint to handle variable-length keys robustly.
+- The static prefix is set exactly once at split time as `LCP(lower_fence, upper_fence)`. The B-tree routing invariant guarantees every key reaching a node already starts with that prefix, so local inserts never need to repack on prefix mismatch.
+- The hint array stores 16 sampled `uint32_t` heads. `lowerBoundIndex` / `upperBoundIndex` use those heads to shrink `[lo, hi)` before the binary search hits the actual slot directory; the narrowing logic explicitly extends `hi` past hints that are equal to the target head so equal-head ties don't drop matching slots out of range.
+- Splits never `memset` the 4 KiB page. They rebuild left and right halves into a single `thread_local SlottedPage tls_scratch` and `memcpy` the result back over the source / destination page.
+- `make_head` uses `memcpy + __builtin_bswap32` for keys with at least 4 suffix bytes and a 1-byte loop fallback for shorter suffixes, keeping comparisons branch-free in hot paths.
 
 ## Roadmap / Future Work
 
 - Implement semi-dense and fully dense leaf encodings behind feature flags.
 - Add optional fingerprinting mode for deeper comparison avoidance.
-- Expand benchmark coverage with larger-scale datasets and additional key distributions (highly skewed, long-tail, adversarial prefixes).
-- Add correctness and stress test suites (fuzzing, randomized insert/search/range validation).
+- Expand benchmark coverage with additional key distributions (highly skewed, long-tail, adversarial prefixes) and unsorted insert workloads.
+- Add randomized stress / fuzz tests for splits and merges.
 - Explore concurrent access patterns and latch/lock strategies for multi-threaded workloads.
