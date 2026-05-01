@@ -101,6 +101,47 @@ std::vector<std::string> generateIntegerStrings(std::size_t count) {
     return keys;
 }
 
+// Densely sequential integer keys (values 0..count-1, no gaps). This is the
+// workload Fully Dense Leaves were designed for: uniform suffix length, dense
+// numeric range, and lex-sorted == numeric-sorted.
+std::vector<std::string> generateDenseIntegerStrings(std::size_t count) {
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::string key = std::to_string(i);
+        if (key.size() < 12) key.insert(key.begin(), 12 - key.size(), '0');
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+// Integer-extractable keys with random gaps. Targets the SDL branch when gaps
+// are small enough that per-leaf numeric range stays under kSdlMaxCapacity;
+// larger gaps fall back to comparison leaves (still benefits from heads/hints).
+std::vector<std::string> generateSparseIntegerStrings(std::size_t count,
+                                                      std::mt19937_64& rng,
+                                                      int max_gap = 32) {
+    std::uniform_int_distribution<int> gap_dist(1, max_gap);
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    std::uint64_t v = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        v += static_cast<std::uint64_t>(gap_dist(rng));
+        std::string key = std::to_string(v);
+        if (key.size() < 12) key.insert(key.begin(), 12 - key.size(), '0');
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+// Tight-gap sequential integer keys that fit comfortably inside SDL's numeric
+// span budget (kSdlMaxCapacity=512). Average gap ~2 keeps per-leaf range under
+// the cap so the layout chooser promotes most leaves to SDL.
+std::vector<std::string> generateTightGapIntegerStrings(std::size_t count,
+                                                        std::mt19937_64& rng) {
+    return generateSparseIntegerStrings(count, rng, 3);
+}
+
 // Volatile sink prevents the optimizer (especially under LTO) from deleting
 // the work in benchmark loops whose results are otherwise unobserved.
 volatile std::uint64_t g_sink = 0;
@@ -138,6 +179,22 @@ void runDatasetBenchmark(const std::string& dataset_name, const std::vector<std:
     measureThroughput("insert", keys.size(), [&] {
         for (std::size_t i = 0; i < keys.size(); ++i) tree.insert(keys[i], static_cast<abt::Value>(i));
     });
+
+    {
+        const auto stats = tree.layoutStats();
+        const std::size_t total_leaves = stats.n_comparison + stats.n_fdl + stats.n_sdl;
+        std::cout << std::left << std::setw(22) << "leaf layout"
+                  << " : cmp=" << stats.n_comparison
+                  << " fdl=" << stats.n_fdl
+                  << " sdl=" << stats.n_sdl
+                  << " (" << total_leaves << " leaves)";
+        if (stats.total_dense_capacity > 0) {
+            const double density =
+                static_cast<double>(stats.total_entries) / stats.total_dense_capacity;
+            std::cout << " dense_density=" << std::fixed << std::setprecision(3) << density;
+        }
+        std::cout << "\n";
+    }
 
     measureThroughput("point lookup", query_count, [&] {
         std::size_t found = 0;
@@ -226,6 +283,60 @@ void runCorrectnessSelfCheck() {
     verify("urls", generateUrls(kCount, rng));
     verify("wiki", generateWikiTitles(kCount, rng));
     verify("ints", generateIntegerStrings(kCount));
+    verify("dense_ints", generateDenseIntegerStrings(kCount));
+    verify("sparse_ints", generateSparseIntegerStrings(kCount, rng));
+
+    // erase-mix: insert N keys, erase the first N/2, verify the second N/2
+    // are still retrievable and erased keys are gone, then re-insert the
+    // erased half and verify all N retrievable. Exercises split + merge +
+    // adaptive demote in interleaved mode.
+    {
+        constexpr std::size_t kEraseCount = 50000;
+        std::mt19937_64 ergng(0xDEAD'BEEFULL);
+        const auto keys = generateSparseIntegerStrings(kEraseCount, ergng);
+        abt::AdaptiveBTree tree;
+        for (std::size_t i = 0; i < kEraseCount; ++i)
+            tree.insert(keys[i], static_cast<abt::Value>(i));
+        for (std::size_t i = 0; i < kEraseCount / 2; ++i)
+        {
+            if (!tree.erase(keys[i]))
+            {
+                std::cerr << "[ERASE-MIX] erase missed at i=" << i
+                          << " key=\"" << keys[i] << "\"\n";
+                std::abort();
+            }
+        }
+        for (std::size_t i = 0; i < kEraseCount / 2; ++i)
+        {
+            if (tree.search(keys[i]).has_value())
+            {
+                std::cerr << "[ERASE-MIX] erased key still findable at i=" << i << "\n";
+                std::abort();
+            }
+        }
+        for (std::size_t i = kEraseCount / 2; i < kEraseCount; ++i)
+        {
+            const auto v = tree.search(keys[i]);
+            if (!v || *v != static_cast<abt::Value>(i))
+            {
+                std::cerr << "[ERASE-MIX] retained key missing at i=" << i << "\n";
+                std::abort();
+            }
+        }
+        for (std::size_t i = 0; i < kEraseCount / 2; ++i)
+            tree.insert(keys[i], static_cast<abt::Value>(i));
+        for (std::size_t i = 0; i < kEraseCount; ++i)
+        {
+            const auto v = tree.search(keys[i]);
+            if (!v || *v != static_cast<abt::Value>(i))
+            {
+                std::cerr << "[ERASE-MIX] re-insert key missing at i=" << i << "\n";
+                std::abort();
+            }
+        }
+        std::cout << "[selfcheck] erase_mix: " << kEraseCount
+                  << " insert/erase/search OK\n";
+    }
 }
 
 } // namespace
@@ -257,10 +368,16 @@ int main(int argc, char** argv) {
             const std::vector<std::string> url_keys = generateUrls(count, rng);
             const std::vector<std::string> wiki_keys = generateWikiTitles(count, rng);
             const std::vector<std::string> integer_keys = generateIntegerStrings(count);
+            const std::vector<std::string> dense_int_keys = generateDenseIntegerStrings(count);
+            const std::vector<std::string> sparse_int_keys = generateSparseIntegerStrings(count, rng);
+            const std::vector<std::string> tight_int_keys = generateTightGapIntegerStrings(count, rng);
 
             runDatasetBenchmark("URL-style strings", url_keys, rng);
             runDatasetBenchmark("Wikipedia-style titles", wiki_keys, rng);
-            runDatasetBenchmark("Integer strings", integer_keys, rng);
+            runDatasetBenchmark("Integer strings (sparse, i*17+11)", integer_keys, rng);
+            runDatasetBenchmark("Integer strings (dense sequential)", dense_int_keys, rng);
+            runDatasetBenchmark("Integer strings (sparse-gap 1..32)", sparse_int_keys, rng);
+            runDatasetBenchmark("Integer strings (tight-gap 1..3, SDL target)", tight_int_keys, rng);
         }
     } catch (const std::exception& ex) {
         std::cerr << "benchmark failed: " << ex.what() << "\n";

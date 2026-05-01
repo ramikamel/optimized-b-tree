@@ -1,6 +1,8 @@
 #include "adaptive_btree/inner_node.hpp"
 
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace abt
 {
@@ -79,6 +81,91 @@ namespace abt
     {
         if (child_index == 0) return page_.link();
         return page_.rightChild(static_cast<std::uint16_t>(child_index - 1));
+    }
+
+    void InnerNode::eraseSeparatorAt(std::uint16_t pos)
+    {
+        auto& hdr = *reinterpret_cast<SlottedPage::Header*>(page_.rawBytes());
+        const std::uint16_t n = hdr.slot_count;
+        if (pos >= n) return;
+        auto* slots = reinterpret_cast<SlottedPage::InnerSlot*>(
+            page_.rawBytes() + sizeof(SlottedPage::Header) + kHintCount * sizeof(std::uint32_t));
+        if (pos + 1 < n)
+        {
+            std::memmove(slots + pos, slots + pos + 1,
+                         (n - pos - 1) * sizeof(SlottedPage::InnerSlot));
+        }
+        hdr.slot_count = static_cast<std::uint16_t>(n - 1);
+        hdr.free_begin = static_cast<std::uint16_t>(hdr.free_begin - sizeof(SlottedPage::InnerSlot));
+        page_.rebuildHints();
+    }
+
+    bool InnerNode::isUnderflow() const
+    {
+        const std::size_t used = kPageSizeBytes - page_.freeSpace();
+        return used <= kMergeUnderflowBytes;
+    }
+
+    bool InnerNode::tryMergeFrom(InnerNode& right, std::string_view promoted_sep)
+    {
+        // Build the merged layout: left's separators, then promoted_sep
+        // pointing to right.leftChild(), then right's separators with their
+        // right_children. New fences: this->lower, right->upper. New leftChild:
+        // this->leftChild() (unchanged).
+
+        thread_local std::string lower_buf;
+        thread_local std::string upper_buf;
+        lower_buf.assign(page_.lowerFenceView());
+        upper_buf.assign(right.page_.upperFenceView());
+        const bool had_lower = page_.hasLowerFence();
+        const bool had_upper = right.page_.hasUpperFence();
+        const std::string_view ml = had_lower ? std::string_view(lower_buf) : std::string_view{};
+        const std::string_view mu = had_upper ? std::string_view(upper_buf) : std::string_view{};
+        const NodeId left_child = page_.link();
+        const NodeId mid_child = right.page_.link();
+
+        // Snapshot left's separators (full keys) first; then the promoted sep;
+        // then right's separators. The right_child for each entry comes from
+        // the source slot.
+        struct InnerEntry { std::string sep; NodeId rc; };
+        std::vector<InnerEntry> entries;
+        entries.reserve(page_.slotCount() + 1 + right.page_.slotCount());
+        const std::string_view lpfx = page_.prefixView();
+        for (std::uint16_t i = 0; i < page_.slotCount(); ++i)
+        {
+            const std::string_view s = page_.keySuffix(i);
+            std::string full;
+            full.reserve(lpfx.size() + s.size());
+            full.append(lpfx);
+            full.append(s);
+            entries.push_back({std::move(full), page_.rightChild(i)});
+        }
+        entries.push_back({std::string(promoted_sep), mid_child});
+        const std::string_view rpfx = right.page_.prefixView();
+        for (std::uint16_t i = 0; i < right.page_.slotCount(); ++i)
+        {
+            const std::string_view s = right.page_.keySuffix(i);
+            std::string full;
+            full.reserve(rpfx.size() + s.size());
+            full.append(rpfx);
+            full.append(s);
+            entries.push_back({std::move(full), right.page_.rightChild(i)});
+        }
+
+        // Build into tls_scratch.
+        tls_scratch.init(NodeType::kInner, ml, mu);
+        tls_scratch.setLink(left_child);
+        const std::size_t pfx_len = tls_scratch.prefixView().size();
+        for (const auto& e : entries)
+        {
+            if (e.sep.size() < pfx_len) return false;
+            const std::string_view suf(e.sep.data() + pfx_len, e.sep.size() - pfx_len);
+            if (!tls_scratch.hasSpaceForInner(suf.size())) return false;
+            tls_scratch.appendInner(suf, e.rc, make_head(suf));
+        }
+        tls_scratch.rebuildHints();
+        std::memcpy(page_.rawBytes(), tls_scratch.rawBytes(), kPageSizeBytes);
+        return true;
     }
 
     std::string InnerNode::splitInto(InnerNode& right_node)

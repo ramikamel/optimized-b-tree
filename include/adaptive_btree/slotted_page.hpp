@@ -37,8 +37,9 @@ namespace abt
             std::uint16_t lower_fence_len;
             std::uint16_t upper_fence_off;  // 0 == no upper fence (unbounded above)
             std::uint16_t upper_fence_len;
-            std::uint8_t  node_type;        // NodeType
-            std::uint8_t  reserved[3];
+            std::uint8_t  node_type;        // NodeType  (offset 16)
+            std::uint8_t  leaf_kind;        // LeafKind  (offset 17; only meaningful for leaves)
+            std::uint8_t  reserved[2];
             NodeId        link;             // left_child for inner, next_leaf for leaf
         };
 
@@ -70,6 +71,8 @@ namespace abt
         void init(NodeType type, std::string_view lower_fence, std::string_view upper_fence);
 
         NodeType type() const { return static_cast<NodeType>(header().node_type); }
+        LeafKind leafKind() const { return static_cast<LeafKind>(header().leaf_kind); }
+        void setLeafKind(LeafKind k) { header().leaf_kind = static_cast<std::uint8_t>(k); }
         std::uint16_t slotCount() const { return header().slot_count; }
         std::size_t freeSpace() const { return static_cast<std::size_t>(header().free_end - header().free_begin); }
 

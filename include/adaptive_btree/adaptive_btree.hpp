@@ -23,11 +23,28 @@ namespace abt
         bool insert(std::string_view key, Value value);
         bool insert(const std::string& key, Value value) { return insert(std::string_view(key), value); }
 
+        // Returns true iff a key was removed. Triggers leaf merge + bubble-up
+        // inner-merge when the touched leaf falls below the underflow
+        // threshold; layout is re-evaluated adaptively after each merge.
+        bool erase(std::string_view key);
+        bool erase(const std::string& key) { return erase(std::string_view(key)); }
+
         std::optional<Value> search(std::string_view key) const;
         std::vector<KeyValue> rangeScan(std::string_view start_key, std::size_t max_results) const;
 
         std::size_t size() const { return size_; }
         std::size_t height() const { return height_; }
+
+        // Per-leaf-kind statistics (Phase 7 observability).
+        struct LayoutStats
+        {
+            std::size_t n_comparison = 0;
+            std::size_t n_fdl = 0;
+            std::size_t n_sdl = 0;
+            std::size_t total_entries = 0;
+            std::size_t total_dense_capacity = 0;
+        };
+        LayoutStats layoutStats() const;
 
     private:
         NodeId allocateLeaf();

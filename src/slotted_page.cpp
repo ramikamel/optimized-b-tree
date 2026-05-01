@@ -16,6 +16,10 @@ namespace abt
     {
         Header h{};
         h.node_type = static_cast<std::uint8_t>(type);
+        // Default leaf kind is kComparison; FDL/SDL leaves are materialized via
+        // their own init paths in fdl_layout.hpp / sdl_layout.hpp which set this
+        // field directly. Inner nodes leave leaf_kind = 0 (irrelevant).
+        h.leaf_kind = static_cast<std::uint8_t>(LeafKind::kComparison);
         h.slot_count = 0;
         h.free_begin = static_cast<std::uint16_t>(kSlotBaseOffset);
         h.free_end = static_cast<std::uint16_t>(kPageSizeBytes);

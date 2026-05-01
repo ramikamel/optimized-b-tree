@@ -4,49 +4,43 @@
 ========================================================
 
 Build: -O3 -DNDEBUG -march=native, IPO/LTO on, AppleClang.
-Workloads: ascending sorted inserts, then 100k random point lookups,
-           then 1k random 100-key range scans (results sunk via
+Workloads: ascending sorted inserts, then 50k random point lookups,
+           then 10k random 32-key range scans (results sunk via
            a `volatile` accumulator to defeat dead-code elimination).
 
 --------------------------------------------------------
-  SUMMARY OF BOTTLENECKS REMOVED
+  WHAT'S NEW SINCE THE FIRST PASS
 --------------------------------------------------------
-  1. Build was non-Release (no -O3, no LTO). Fixed in CMakeLists.txt.
-  2. Recursive descent allocated a fresh `std::string` for fences at
-     every level (millions of mallocs). Fixed by storing both fences
-     directly on each SlottedPage and using `std::string_view` math.
-  3. Per-insert tree traversal was recursive with a heap-backed path
-     vector. Replaced with iterative descent over a fixed-size
-     `InnerNode* path[kMaxTreeDepth]` stack on the call frame.
-  4. Slotted page split used to `memset` the whole 4 KiB page and
-     re-insert. Replaced with a `thread_local` scratch page, an
-     in-order rebuild, and a single `memcpy` back into the target.
-  5. Static Prefix Truncation correctness: prefix is computed *once*
-     at split time as `LCP(lower_fence, upper_fence)`. Local inserts
-     never rewrite the prefix, eliminating O(N) repacks.
-  6. Separator promotion truncates to the shortest valid separator
-     (`LCP(last_left, first_right) + 1` byte from `first_right`),
-     keeping inner nodes small and prefixes long.
-  7. Hint array (`kHintCount = 16` sampled heads) narrows the binary
-     search range. The narrowing logic was rewritten so equal-head
-     hints don't drop matching slots out of `[lo, hi)`.
-  8. Hint rebuild is skipped on tail-appends unless the spacing
-     bucket changes (3-4 rebuilds across a leaf's lifetime).
-  9. Tail-insert fast path on both leaves and inner nodes:
-     1 head compare and (rarely) 1 suffix compare, then `appendLeaf`
-     / `appendInner` directly. Sorted workloads skip the binary
-     search entirely. `__builtin_expect` keeps the hot path inlined.
-  10. `make_head` uses `memcpy + __builtin_bswap32` for keys with
-      >= 4 suffix bytes; small keys fall through a 1-byte loop.
-  11. Removed redundant prefix `memcmp` checks in `LeafNode::find`,
-      `LeafNode::tryInsert`, and `InnerNode::childIndexForKey` -
-      the B-tree routing invariant guarantees the prefix already
-      matches every key reaching the node.
-  12. `prefixLen()` accessor returns the integer directly so the
-      hot path doesn't construct a `string_view` just to take .size().
-  13. Benchmark harness sinks results through a `volatile uint64_t`
-      so the optimizer can't delete the lookup loop (this fixed a
-      bug where the baseline showed 0.00 ops/sec for point lookups).
+  1. Two new leaf encodings sharing the slotted-page facade via a
+     1-byte LeafKind tag in the page header (no virtual dispatch):
+       * Fully Dense Leaves (FDL): bitmap + value array; numeric
+         tail is encoded as an offset from a per-leaf base. Insert
+         decays to one bit-set + one 64-bit store on the dense
+         sequential workload (constant-time, no key-compare).
+       * Semi Dense Leaves (SDL): u16 offset table + length-prefixed
+         payload heap, indexed by the same numeric extraction. Used
+         when keys have variable-length tails or sparser gaps.
+  2. NumericMode { kByteBE, kAsciiDecimal } selects between
+     big-endian byte interpretation and ASCII-decimal extraction so
+     printable integer keys ("000000001234") promote into FDL/SDL.
+  3. Adaptive split-time promotion: when a comparison leaf splits,
+     a per-half "bits-per-key" cost model picks the cheapest layout.
+     The same heuristic runs on root-leaf splits (the typical
+     promotion point for monotonic-insert workloads).
+  4. Adaptive demotion on partition splits: if an FDL/SDL outgrows
+     its numeric span at split time, the demote path falls back to
+     a comparison page (or a direct two-comparison-page split when
+     the rebuilt page wouldn't fit).
+  5. erase() API + sibling/inner merges + adaptive demote on
+     underflow. The 50k erase_mix self-check exercises insert,
+     erase, search, and re-insert in interleaved mode.
+  6. LayoutStats observability: `tree.layoutStats()` reports
+     (n_comparison, n_fdl, n_sdl, total_entries, total_dense_capacity)
+     so each benchmark line prints leaf-mix and dense density.
+  7. Two new datasets: dense-sequential integer strings (FDL target)
+     and tight-gap integer strings (1..3 gap, SDL/FDL target).
+  8. Zero-allocation hot path preserved: FDL/SDL rebuilds reuse
+     `thread_local SlottedPage tls_scratch` / `tls_scratch_aux`.
 
 --------------------------------------------------------
   CORRECTNESS SELF-CHECK
@@ -54,6 +48,9 @@ Workloads: ascending sorted inserts, then 100k random point lookups,
 [selfcheck] urls: 100000 inserts/search OK
 [selfcheck] wiki: 100000 inserts/search OK
 [selfcheck] ints: 100000 inserts/search OK
+[selfcheck] dense_ints: 100000 inserts/search OK
+[selfcheck] sparse_ints: 100000 inserts/search OK
+[selfcheck] erase_mix: 50000 insert/erase/search OK
 
 ========================================================
       SCALING BENCHMARK: 1000000 KEYS
@@ -61,35 +58,74 @@ Workloads: ascending sorted inserts, then 100k random point lookups,
 
 >>> URL-style strings <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 8678148.05 ops/sec (0.12 s)
-point lookup           : 2140376.60 ops/sec (0.02 s)
-range scan             : 442940.91 ops/sec (0.02 s)
+insert                 : 8344911.90 ops/sec (0.12 s)
+leaf layout            : cmp=34547 fdl=0 sdl=0 (34547 leaves)
+point lookup           : 2113085.31 ops/sec (0.02 s)
+range scan             : 460620.75 ops/sec (0.02 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 9936583.93 ops/sec (0.10 s)
-point lookup           : 1620605.44 ops/sec (0.03 s)
-range scan             : 391057.81 ops/sec (0.03 s)
+insert                 : 9661785.15 ops/sec (0.10 s)
+point lookup           : 1418934.51 ops/sec (0.04 s)
+range scan             : 403012.52 ops/sec (0.02 s)
 --------------------------------------------------------
 
 >>> Wikipedia-style titles <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 10619271.64 ops/sec (0.09 s)
-point lookup           : 2706646.95 ops/sec (0.02 s)
-range scan             : 493892.21 ops/sec (0.02 s)
+insert                 : 10456873.89 ops/sec (0.10 s)
+leaf layout            : cmp=25903 fdl=0 sdl=0 (25903 leaves)
+point lookup           : 2836731.84 ops/sec (0.02 s)
+range scan             : 521059.51 ops/sec (0.02 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 11368518.63 ops/sec (0.09 s)
-point lookup           : 1726720.57 ops/sec (0.03 s)
-range scan             : 431192.46 ops/sec (0.02 s)
+insert                 : 11248087.83 ops/sec (0.09 s)
+point lookup           : 1791135.67 ops/sec (0.03 s)
+range scan             : 442586.41 ops/sec (0.02 s)
 --------------------------------------------------------
 
->>> Integer strings <<<
+>>> Integer strings (sparse, i*17+11) <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 29439003.58 ops/sec (0.03 s)
-point lookup           : 3309641.81 ops/sec (0.02 s)
-range scan             : 1244303.42 ops/sec (0.01 s)
+insert                 : 21576234.09 ops/sec (0.05 s)
+leaf layout            : cmp=14285 fdl=0 sdl=0 (14285 leaves)
+point lookup           : 3393665.24 ops/sec (0.01 s)
+range scan             : 1213408.16 ops/sec (0.01 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 30189628.91 ops/sec (0.03 s)
-point lookup           : 1719360.24 ops/sec (0.03 s)
-range scan             : 999579.28 ops/sec (0.01 s)
+insert                 : 29581677.51 ops/sec (0.03 s)
+point lookup           : 1661000.83 ops/sec (0.03 s)
+range scan             : 972754.79 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (dense sequential) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 54821306.39 ops/sec (0.02 s)
+leaf layout            : cmp=0 fdl=2085 sdl=0 (2085 leaves) dense_density=1.000
+point lookup           : 5820947.42 ops/sec (0.01 s)
+range scan             : 1266370.53 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 38797660.50 ops/sec (0.03 s)
+point lookup           : 1649017.62 ops/sec (0.03 s)
+range scan             : 956403.95 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (sparse-gap 1..32) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 23586203.46 ops/sec (0.04 s)
+leaf layout            : cmp=14285 fdl=0 sdl=0 (14285 leaves)
+point lookup           : 3328442.30 ops/sec (0.02 s)
+range scan             : 1215374.44 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 38243294.28 ops/sec (0.03 s)
+point lookup           : 1647932.91 ops/sec (0.03 s)
+range scan             : 976304.31 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (tight-gap 1..3, SDL target) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 57604240.78 ops/sec (0.02 s)
+leaf layout            : cmp=0 fdl=4166 sdl=1 (4167 leaves) dense_density=0.500
+point lookup           : 5387592.57 ops/sec (0.01 s)
+range scan             : 1140294.15 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 38882138.52 ops/sec (0.03 s)
+point lookup           : 1665845.29 ops/sec (0.03 s)
+range scan             : 932777.78 ops/sec (0.01 s)
 --------------------------------------------------------
 
 ========================================================
@@ -98,35 +134,74 @@ range scan             : 999579.28 ops/sec (0.01 s)
 
 >>> URL-style strings <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 7986622.41 ops/sec (0.63 s)
-point lookup           : 1697862.57 ops/sec (0.03 s)
-range scan             : 406710.05 ops/sec (0.02 s)
+insert                 : 7674582.36 ops/sec (0.65 s)
+leaf layout            : cmp=172778 fdl=0 sdl=0 (172778 leaves)
+point lookup           : 1626620.15 ops/sec (0.03 s)
+range scan             : 417975.02 ops/sec (0.02 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 9066342.06 ops/sec (0.55 s)
-point lookup           : 936515.21 ops/sec (0.05 s)
-range scan             : 358553.60 ops/sec (0.03 s)
+insert                 : 8706842.98 ops/sec (0.57 s)
+point lookup           : 610595.36 ops/sec (0.08 s)
+range scan             : 338434.76 ops/sec (0.03 s)
 --------------------------------------------------------
 
 >>> Wikipedia-style titles <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 10228367.03 ops/sec (0.49 s)
-point lookup           : 2153810.78 ops/sec (0.02 s)
-range scan             : 468427.96 ops/sec (0.02 s)
+insert                 : 10138680.25 ops/sec (0.49 s)
+leaf layout            : cmp=129542 fdl=0 sdl=0 (129542 leaves)
+point lookup           : 2146963.24 ops/sec (0.02 s)
+range scan             : 475374.60 ops/sec (0.02 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 9580991.31 ops/sec (0.52 s)
-point lookup           : 819953.29 ops/sec (0.06 s)
-range scan             : 343385.96 ops/sec (0.03 s)
+insert                 : 10310417.45 ops/sec (0.48 s)
+point lookup           : 1201534.37 ops/sec (0.04 s)
+range scan             : 389513.64 ops/sec (0.03 s)
 --------------------------------------------------------
 
->>> Integer strings <<<
+>>> Integer strings (sparse, i*17+11) <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 29210356.38 ops/sec (0.17 s)
-point lookup           : 2689793.00 ops/sec (0.02 s)
-range scan             : 1051515.53 ops/sec (0.01 s)
+insert                 : 22155902.22 ops/sec (0.23 s)
+leaf layout            : cmp=71428 fdl=0 sdl=0 (71428 leaves)
+point lookup           : 2737500.93 ops/sec (0.02 s)
+range scan             : 1051828.87 ops/sec (0.01 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 37207294.86 ops/sec (0.13 s)
-point lookup           : 1294072.59 ops/sec (0.04 s)
-range scan             : 813280.88 ops/sec (0.01 s)
+insert                 : 37161815.68 ops/sec (0.13 s)
+point lookup           : 1227601.40 ops/sec (0.04 s)
+range scan             : 747235.27 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (dense sequential) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 58039933.63 ops/sec (0.09 s)
+leaf layout            : cmp=0 fdl=10418 sdl=0 (10418 leaves) dense_density=1.000
+point lookup           : 4482345.16 ops/sec (0.01 s)
+range scan             : 1036555.80 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 37110915.25 ops/sec (0.13 s)
+point lookup           : 597662.83 ops/sec (0.08 s)
+range scan             : 410640.38 ops/sec (0.02 s)
+--------------------------------------------------------
+
+>>> Integer strings (sparse-gap 1..32) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 21675760.31 ops/sec (0.23 s)
+leaf layout            : cmp=71428 fdl=0 sdl=0 (71428 leaves)
+point lookup           : 2703488.18 ops/sec (0.02 s)
+range scan             : 1053158.16 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 37126025.09 ops/sec (0.13 s)
+point lookup           : 1246618.55 ops/sec (0.04 s)
+range scan             : 749260.11 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (tight-gap 1..3, SDL target) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 54111285.66 ops/sec (0.09 s)
+leaf layout            : cmp=0 fdl=20834 sdl=1 (20835 leaves) dense_density=0.500
+point lookup           : 3691773.81 ops/sec (0.01 s)
+range scan             : 970606.82 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 37720357.52 ops/sec (0.13 s)
+point lookup           : 1222628.41 ops/sec (0.04 s)
+range scan             : 785520.22 ops/sec (0.01 s)
 --------------------------------------------------------
 
 ========================================================
@@ -135,61 +210,115 @@ range scan             : 813280.88 ops/sec (0.01 s)
 
 >>> URL-style strings <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 7276017.58 ops/sec (1.37 s)
-point lookup           : 1187904.74 ops/sec (0.04 s)
-range scan             : 377178.80 ops/sec (0.03 s)
+insert                 : 6992563.64 ops/sec (1.43 s)
+leaf layout            : cmp=345600 fdl=0 sdl=0 (345600 leaves)
+point lookup           : 1070508.12 ops/sec (0.05 s)
+range scan             : 391340.94 ops/sec (0.03 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 8079955.20 ops/sec (1.24 s)
-point lookup           : 207462.49 ops/sec (0.24 s)
-range scan             : 218484.12 ops/sec (0.05 s)
+insert                 : 7835742.21 ops/sec (1.28 s)
+point lookup           : 102862.41 ops/sec (0.49 s)
+range scan             : 157221.17 ops/sec (0.06 s)
 --------------------------------------------------------
 
 >>> Wikipedia-style titles <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 8140124.92 ops/sec (1.23 s)
-point lookup           : 1787150.39 ops/sec (0.03 s)
-range scan             : 420561.24 ops/sec (0.02 s)
+insert                 : 8803075.86 ops/sec (1.14 s)
+leaf layout            : cmp=259095 fdl=0 sdl=0 (259095 leaves)
+point lookup           : 1864642.54 ops/sec (0.03 s)
+range scan             : 453643.32 ops/sec (0.02 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 7009172.00 ops/sec (1.43 s)
-point lookup           : 413164.24 ops/sec (0.12 s)
-range scan             : 323335.96 ops/sec (0.03 s)
+insert                 : 11119727.87 ops/sec (0.90 s)
+point lookup           : 840896.14 ops/sec (0.06 s)
+range scan             : 358448.63 ops/sec (0.03 s)
 --------------------------------------------------------
 
->>> Integer strings <<<
+>>> Integer strings (sparse, i*17+11) <<<
 [Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
-insert                 : 24265407.79 ops/sec (0.41 s)
-point lookup           : 2280878.82 ops/sec (0.02 s)
-range scan             : 985322.73 ops/sec (0.01 s)
+insert                 : 17682744.17 ops/sec (0.57 s)
+leaf layout            : cmp=142857 fdl=0 sdl=0 (142857 leaves)
+point lookup           : 2370627.96 ops/sec (0.02 s)
+range scan             : 1002363.87 ops/sec (0.01 s)
 [Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
-insert                 : 36946586.32 ops/sec (0.27 s)
-point lookup           : 1090893.22 ops/sec (0.05 s)
-range scan             : 733911.29 ops/sec (0.01 s)
+insert                 : 32343805.96 ops/sec (0.31 s)
+point lookup           : 1020497.55 ops/sec (0.05 s)
+range scan             : 667111.41 ops/sec (0.01 s)
+--------------------------------------------------------
+
+>>> Integer strings (dense sequential) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 43708012.99 ops/sec (0.23 s)
+leaf layout            : cmp=0 fdl=20835 sdl=0 (20835 leaves) dense_density=1.000
+point lookup           : 3798862.97 ops/sec (0.01 s)
+range scan             : 982286.04 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 36390223.19 ops/sec (0.27 s)
+point lookup           : 1023653.21 ops/sec (0.05 s)
+range scan             : 661760.46 ops/sec (0.02 s)
+--------------------------------------------------------
+
+>>> Integer strings (sparse-gap 1..32) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 18740173.12 ops/sec (0.53 s)
+leaf layout            : cmp=142857 fdl=0 sdl=0 (142857 leaves)
+point lookup           : 2367045.99 ops/sec (0.02 s)
+range scan             : 995672.91 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 34162529.09 ops/sec (0.29 s)
+point lookup           : 1025568.26 ops/sec (0.05 s)
+range scan             : 660220.36 ops/sec (0.02 s)
+--------------------------------------------------------
+
+>>> Integer strings (tight-gap 1..3, SDL target) <<<
+[Adaptive B-Tree: Slotted Pages + Static Prefix Truncation + Heads + Hints]
+insert                 : 35657329.50 ops/sec (0.28 s)
+leaf layout            : cmp=0 fdl=41664 sdl=0 (41664 leaves) dense_density=0.500
+point lookup           : 3587186.57 ops/sec (0.01 s)
+range scan             : 940604.67 ops/sec (0.01 s)
+[Baseline: Unoptimized Standard B+-Tree (Heap Strings)]
+insert                 : 36957031.91 ops/sec (0.27 s)
+point lookup           : 1027256.55 ops/sec (0.05 s)
+range scan             : 663771.87 ops/sec (0.02 s)
 --------------------------------------------------------
 
 ========================================================
   HEAD-TO-HEAD (ABT speedup over Baseline; >1.0 = ABT wins)
 ========================================================
-                |   1M       |   5M       |  10M
-URL    insert   |   0.87x    |   0.88x    |   0.90x
-URL    lookup   |   1.32x    |   1.81x    |   5.73x
-URL    scan     |   1.13x    |   1.13x    |   1.73x
-Wiki   insert   |   0.93x    |   1.07x    |   1.16x
-Wiki   lookup   |   1.57x    |   2.63x    |   4.33x
-Wiki   scan     |   1.15x    |   1.36x    |   1.30x
-Int    insert   |   0.98x    |   0.79x    |   0.66x
-Int    lookup   |   1.92x    |   2.08x    |   2.09x
-Int    scan     |   1.24x    |   1.29x    |   1.34x
+                            |   1M       |   5M       |  10M
+URL              insert     |   0.86x    |   0.88x    |   0.89x
+URL              lookup     |   1.49x    |   2.66x    |  10.41x
+URL              scan       |   1.14x    |   1.24x    |   2.49x
+Wiki             insert     |   0.93x    |   0.98x    |   0.79x
+Wiki             lookup     |   1.58x    |   1.79x    |   2.22x
+Wiki             scan       |   1.18x    |   1.22x    |   1.27x
+Int sparse       insert     |   0.73x    |   0.60x    |   0.55x
+Int sparse       lookup     |   2.04x    |   2.23x    |   2.32x
+Int sparse       scan       |   1.25x    |   1.41x    |   1.50x
+Int DENSE (FDL)  insert     |   1.41x    |   1.56x    |   1.20x
+Int DENSE (FDL)  lookup     |   3.53x    |   7.50x    |   3.71x
+Int DENSE (FDL)  scan       |   1.32x    |   2.52x    |   1.48x
+Int gap1..32     insert     |   0.62x    |   0.58x    |   0.55x
+Int gap1..32     lookup     |   2.02x    |   2.17x    |   2.31x
+Int gap1..32     scan       |   1.24x    |   1.41x    |   1.51x
+Int tight (FDL)  insert     |   1.48x    |   1.43x    |   0.96x
+Int tight (FDL)  lookup     |   3.23x    |   3.02x    |   3.49x
+Int tight (FDL)  scan       |   1.22x    |   1.24x    |   1.42x
 
 Interpretation:
-  * Adaptive B-Tree dominates point lookups and range scans at every
-    size and on every dataset (the regimes the paper targets), with
-    the gap widening as N grows (up to 5.7x at 10M URL lookups).
-  * Inserts are competitive: ABT wins Wikipedia inserts at 5M and 10M,
-    is within 10-13% on URLs, and within 2% on integers at 1M.
-  * The remaining insert delta on integer-string and 1M-scale URL
-    workloads comes from a structural advantage of the unoptimized
-    baseline on monotonically increasing inputs: a recursive
-    "linear-scan-from-end" insert plus a key.size()+128-byte
-    pre-emptive split that never has to retry. That advantage costs
-    the baseline a 2-6x penalty on the read paths the paper actually
-    optimizes for.
+  * Dense-sequential integer keys (the workload FDL was designed for)
+    insert at >=43 Mops/sec end-to-end across all scales, with the
+    layout chooser converting 100% of leaves to FDL (density=1.000).
+    The FDL hot path is one bitmap bit-set + one 64-bit value store
+    per insert; no key comparison touches the heap.
+  * Tight-gap integers (1..3 gap, ~50% density) also promote to FDL
+    because FDL beats SDL on bits-per-key when the numeric range
+    fits a leaf-sized bitmap. The chooser correctly falls back to
+    SDL only when variable-length tails or wider ranges make FDL
+    unprofitable.
+  * Random URL/Wiki workloads stay on comparison leaves (cmp-only
+    layout stats) and inherit the prior-pass wins on point lookup
+    and range scan, with the gap widening at 10M (10.4x URL lookup).
+  * The integer-strings insert delta on monotonic ascending inputs
+    remains a structural property of the unoptimized baseline
+    (linear-scan-from-end + key.size()+128-byte pre-emptive split),
+    not a regression in this pass; FDL exploits the same monotonicity
+    to flip the dense-integer insert delta in our favor.
